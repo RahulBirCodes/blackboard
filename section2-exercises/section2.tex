@@ -1,0 +1,260 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\bytesps}{\text{bytes/s}}
+\newcommand{\AI}{\mathrm{AI}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tmem}{T_{\text{mem}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\TPCIe}{T_{\text{PCIe}}}
+
+\title{Scaling Book --- Section 2 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Q1}
+
+Sample from a 200B-parameter model in bf16. Split weights across 32 TPU v4p.
+
+Per TPU:
+\[
+\frac{2 \cdot 200 \times 10^9 \text{ bytes}}{32} = 1.25 \times 10^{10} \text{ bytes/TPU}.
+\]
+
+TPU v4p HBM $\to$ VMEM bandwidth $= 1.2\mathrm{e}12$ bytes/s.
+
+Total time to load to systolic array:
+\[
+\frac{1.25 \times 10^{10}}{1.2 \times 10^{12}} \,\text{s} \;\approx\; 0.01\,\text{s} \;=\; 10\,\text{ms}.
+\]
+
+If sampling from the model is memory bound, then this becomes a lower bound for the latency of sampling.
+
+\section*{Q2}
+
+\subsection*{(a) TPU v5e pod ($16 \times 16$ 2D torus)}
+
+\begin{enumerate}[label=(\roman*)]
+  \item Each host is connected to 2 four-chip trays:
+  \[
+  \text{total hosts} = \frac{16 \cdot 16}{8} = 32 \text{ cpu hosts}.
+  \]
+  \item Each v5e chip has 1 TPU core $\Rightarrow$ $256$ total TPU cores in the v5e pod.
+  \item v5e FLOPs/s/chip (bf16) $= 1.97 \times 10^{14}$:
+  \[
+  \text{total pod } \flopss = 256 \cdot 1.97 \times 10^{14} \approx 5.04 \times 10^{16} \; \flopss.
+  \]
+  \item Total HBM $= 256 \times 16 \text{ GB} = 4096 \text{ GB}$.
+\end{enumerate}
+
+\subsection*{(b) TPU v5p pod ($16 \times 20 \times 28$ 3D torus)}
+
+\begin{enumerate}[label=(\roman*)]
+  \item One cpu host is connected to one 4-chip tray:
+  \[
+  \text{total hosts} = \frac{16 \times 20 \times 28}{4} = 2240 \text{ cpu hosts}.
+  \]
+  \item Each v5p chip has 2 TPU cores:
+  \[
+  \text{total cores} = 2 \cdot (16 \times 20 \times 28) = 17{,}920 \text{ TPU cores}.
+  \]
+  \item Total FLOPs/s (bf16):
+  \[
+  (16 \times 20 \times 28) \cdot 4.59 \times 10^{14} \approx 4.1 \times 10^{18} \; \flopss.
+  \]
+  \item Total HBM $= (16 \times 20 \times 28) \cdot 96 \text{ GB} = 860{,}160 \text{ GB} \approx 860 \text{ TB}$.
+\end{enumerate}
+
+\section*{Q3}
+
+\[
+A : \text{bf16}[D, F], \quad X : \text{bf16}[B, D], \quad X \cdot A : \text{bf16}[B, F].
+\]
+Assume $B \ll D$, $F = 4D$, on TPU v6e.
+
+\begin{align*}
+\text{total } \flops &= BF(D + D - 1) = 2BFD \\
+\text{bytes moved} &= 2DF + 2BD + 2BF
+\end{align*}
+
+\textbf{Intensity (accel)} --- over PCIe:
+\[
+\text{Intensity}(\text{accel}) = \frac{9.20 \times 10^{14}}{1.6 \times 10^{10}} = 57{,}500.
+\]
+
+\textbf{Intensity (comp):}
+\begin{align*}
+\frac{2BFD}{2DF + 2BD + 2BF}
+\;&\xrightarrow{F = 4D}\;
+\frac{2B \cdot 4D \cdot D}{2 \cdot 4D \cdot D + 2BD + 2B \cdot 4D} \\
+&= \frac{8BD^2}{8D^2 + 2BD + 8BD} \\
+&= \frac{8BD^2}{8D^2 + 10BD}
+\;\xrightarrow{B \ll D}\; B.
+\end{align*}
+
+$\therefore$ need $B \geq 57{,}500$ for the computation to remain FLOPs-bound over PCIe.
+
+\section*{Q4}
+
+\[
+W : \text{int8}[16384, 4096], \quad x : \text{int8}[B, 4096], \quad x \cdot W \to \text{int8}[B, 16384] \quad \text{on 1 TPU v5e.}
+\]
+
+\textbf{Common quantities:}
+\begin{align*}
+\flops &= 16384 \cdot B \cdot (2 \cdot 4096) = 134{,}217{,}728\, B \approx 1.34 \times 10^8\, B \\
+\text{bytes} &= (16384 \cdot 4096) + (B \cdot 4096) + (B \cdot 16384) \\
+             &= 20{,}480\, B + 6.7 \times 10^7
+\end{align*}
+
+\subsection*{(i) HBM}
+\begin{align*}
+\Tmath &= \frac{\flops}{\text{v5e } \flopss} = \frac{1.34 \times 10^8\, B}{3.94 \times 10^{14}} \approx 3.4 \times 10^{-7}\, B \\
+\Tmem &= \frac{\text{bytes}}{\text{v5e bw}} = \frac{20{,}480\, B + 6.7 \times 10^7}{8.2 \times 10^{11}}
+\end{align*}
+\[
+\text{total time} \;\geq\; \max\{\Tmath,\, \Tmem\}.
+\]
+
+\textbf{Compute-bound threshold}\,\textsuperscript{$\dagger$}\textsuperscript{$\dagger$}\,\emph{Continuation from page 4 of the notes.}
+
+\begin{align*}
+\text{Intensity}(\text{comp}) &= \frac{1.34 \times 10^8\, B}{2 \times 10^4\, B + 6.7 \times 10^7} \\
+\text{Intensity}(\text{accel}) &= \frac{3.94 \times 10^{14}}{8.2 \times 10^{11}} \approx 480
+\end{align*}
+
+To be compute-bound, $\text{Intensity}(\text{comp}) \geq \text{Intensity}(\text{accel})$:
+\begin{align*}
+(1.34 \times 10^8)\, B &\geq 480 \cdot (2 \times 10^4\, B + 6.7 \times 10^7) \\
+(1.34 \times 10^8)\, B &\geq (9.6 \times 10^6)\, B + 480 \cdot 6.7 \times 10^7 \\
+\left(1.34 \times 10^8 - 9.6 \times 10^6\right) B &\geq 480 \cdot 6.7 \times 10^7 \\
+B &\geq \frac{480 \cdot 6.7 \times 10^7}{1.34 \times 10^8 - 9.6 \times 10^6} \approx 259.
+\end{align*}
+
+\subsection*{(ii) VMEM only}
+VMEM bandwidth $\approx 22 \times$ HBM bandwidth, so
+\[
+\text{total time} \;\geq\; \max\!\left\{\, \underbrace{3.4 \times 10^{-7}\, B}_{\Tmath\text{ (stays same)}},\;\;
+\underbrace{\frac{2 \times 10^4\, B + 6.7 \times 10^7}{22 \cdot 8.2 \times 10^{11}}}_{\Tmem\text{ (22$\times$ lower)}} \,\right\}.
+\]
+
+\textbf{Compute-bound threshold}\,\textsuperscript{$\dagger$}\textsuperscript{$\dagger$}\,\emph{Continuation from page 4 of the notes.}
+
+Using VMEM only, $\text{Intensity}(\text{accel})$ drops by $22\times$, so
+\[
+B \geq \frac{259}{22} \approx 11.
+\]
+
+\section*{Q5}
+
+TPU v5e $4 \times 4$ slice, per-hop latency is $1\,\mu\text{s}$. Want to send $\text{bf16}[8, 128, 8192]$ from $\text{TPU}\{0,0\}$ to $\text{TPU}\{3,3\}$.
+
+Full v5e pod is $16 \times 16$. No wrap around connection in slice!
+
+\emph{Note:} we have 2 output connections from $\text{TPU}\{0,0\}$ and 2 input connections to $\text{TPU}\{3,3\}$, so we can use both connections simultaneously to double our ICI bandwidth.
+
+ICI b/w $= 9 \times 10^{10}$ (bidirectional through 2 paths).
+
+We can think of each path like a pipe.
+
+We have $6 \cdot 1\,\mu\text{s}$ startup time to fill the pipeline at which we reach steady state where data reaches by bytes/bw.
+
+\begin{enumerate}[label=(\roman*)]
+  \item Time for first byte to reach: $6 \cdot 1\,\mu\text{s} = 6\,\mu\text{s}$.
+  \item Total time:
+  \[
+  6\,\mu\text{s} \;+\; \frac{2 \cdot 8 \cdot 128 \cdot 8192}{9 \times 10^{10}}\,\text{s}
+  \;=\; \underbrace{6\,\mu\text{s}}_{\text{startup}} + \underbrace{186\,\mu\text{s}}_{\text{steady state}} = 192\,\mu\text{s}.
+  \]
+\end{enumerate}
+
+\section*{Q6}
+
+\[
+A : \text{bf16}[128 \cdot 1024,\; 128 \cdot 1024], \quad \text{split across TPU v5e } 4 \times 4 \text{ slice but offloaded to host DRAM.}
+\]
+
+Want:
+\begin{enumerate}[label=\arabic*.]
+  \item Copy $A$ to $\text{TPU}\{0,0\}$.
+  \item Multiply by vector $\text{bf16}[8,\; 128 \cdot 1024]$.
+\end{enumerate}
+
+\subsection*{Time for step 1 --- two options}
+
+\textbf{Option 1.} PCIe-copy into TPU HBM, then transfer across ICI. (Note: ICI transfers happen from HBM, no need to move into VMEM first.)
+
+\begin{itemize}[leftmargin=*]
+  \item PCIe load time:
+  \[
+  \TPCIe \;=\; \frac{2 \cdot (128 \cdot 1024)^2}{16 \cdot 1.6 \times 10^{10}} \;=\; 0.07\,\text{s}.
+  \]
+  \item ICI transfer time. $\text{TPU}\{0,0\}$ has 2 input sockets, so effective ICI bw $= 2 \cdot 4.5 \times 10^{10}$ bytes/s. Neighbors are 1 hop away $\Rightarrow$ startup latency $1\,\mu\text{s}$. Afterwards, $\tfrac{15}{16}(128 \cdot 1024)^2$ bytes come in:
+  \[
+  \Tcomm \;=\; 1\,\mu\text{s} \;+\; \frac{\tfrac{15}{16}\,(128 \cdot 1024)^2}{2 \cdot 4.5 \times 10^{10}}\,\text{s} \;\approx\; 0.17\,\text{s}.
+  \]
+  \item Total time for step 1 (Option 1): $\Tcomm + \TPCIe \approx 0.24\,\text{s}$.
+\end{itemize}
+
+\textbf{Option 2.} From host DRAM, transfer using DCN.
+
+\begin{itemize}[leftmargin=*]
+  \item DCN bandwidth $= 6.25 \times 10^9$ bytes/s.
+  \item Total time (also includes time to transfer from host DRAM to TPU HBM):
+  \[
+  \frac{\tfrac{15}{16} \cdot (128 \cdot 1024)^2}{6.25 \times 10^9} \,\text{s} \;=\; 2.57\,\text{s}.
+  \]
+\end{itemize}
+
+\textbf{Option 1 is way better.}
+
+\subsection*{Time for step 2 --- multiply by vector}
+\begin{align*}
+\Tmem  &= \frac{(128 \cdot 1024)^2 \;+\; 2 \cdot 8 \cdot 128 \cdot 1024 \;+\; 2 \cdot 8 \cdot 128 \cdot 1024}{8.2 \times 10^{11}} = 0.02\,\text{s} \\
+\Tcomp &= \frac{2 \cdot (128 \cdot 1024)^2 \cdot 8}{1.97 \times 10^{14}} = 0.001\,\text{s}
+\end{align*}
+
+\subsection*{Bounds on total time}
+\begin{align*}
+\text{lower bound:} \quad \max\{\Tcomm,\; \Tmem,\; \Tcomp,\; \TPCIe\} &\approx 0.17 \,\text{s} \quad \text{(assuming perfect overlap)} \\
+\text{upper bound:} \quad \Tcomm + \Tmem + \Tcomp + \TPCIe &\approx 0.26 \,\text{s}
+\end{align*}
+
+\appendix
+
+\section*{Appendix A --- Pop Quiz}
+
+\begin{itemize}[leftmargin=*]
+  \item TPU v5p has 2 cores.
+  \item Each core's VPU has $4 \cdot 8 \cdot 128$ ALUs.
+\end{itemize}
+
+\[
+\text{TPU v5p vector } \flopss
+\;=\;
+\underbrace{(2 \cdot 4 \cdot 128 \cdot 8)}_{\flops}
+\;\cdot\;
+\underbrace{1.75\mathrm{e}9}_{1/\text{s}}
+\]
+
+\[
+=\;
+\left(2 \cdot 4 \cdot 128 \cdot 8 \cdot 1.75\mathrm{e}9\right)\,\flopss
+\;=\;
+1.43 \times 10^{13}\,\flopss.
+\]
+
+\end{document}

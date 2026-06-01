@@ -1,0 +1,154 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\lstdefinestyle{pythonstyle}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  stringstyle=\color{green!50!black},
+  commentstyle=\color{gray}\itshape,
+  numberstyle=\tiny\color{gray},
+  numbers=left,
+  numbersep=8pt,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=14pt,
+  tabsize=4,
+}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\bytesps}{\text{bytes/s}}
+\newcommand{\AI}{\mathrm{AI}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+
+\title{Scaling Book --- Section 1 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Q1}
+
+Let $X \in \mathbb{R}^{B,D}$, $Y \in \mathbb{R}^{D,F}$, $Z \in \mathbb{R}^{B,F}$, with
+\[
+XY = Z \quad \text{in int8.}
+\]
+
+\subsection*{(i) Bytes loaded / written}
+\begin{align*}
+\text{loaded:} &\quad BD + DF \\
+\text{written:} &\quad BF
+\end{align*}
+
+\subsection*{(ii) FLOPs}
+There are $BF$ dot products, each of cost $D + D - 1$:
+\[
+\underbrace{BF}_{\text{dot prods}} \cdot \underbrace{(D + D - 1)}_{\text{dot prod cost}} \approx 2BFD.
+\]
+
+\subsection*{(iii) Arithmetic intensity}
+\[
+\AI = \frac{2BFD}{BD + DF + BF}.
+\]
+If $B \ll D, F$:
+\[
+\AI \approx \frac{2BFD}{DF} = 2B.
+\]
+
+\subsection*{(iv) Lower / upper bound on runtime}
+\[
+\Tmath = \frac{\flops}{\flopss} = \frac{2BFD}{3.94\mathrm{e}14},
+\qquad
+\Tcomm = \frac{\text{bytes}}{\bytesps} = \frac{BD + DF + BF}{8.2\mathrm{e}11}.
+\]
+\begin{align*}
+\text{lower bound:} &\quad \max(\Tmath,\, \Tcomm) \\
+\text{upper bound:} &\quad \Tmath + \Tcomm
+\end{align*}
+(plug in above)
+
+\section*{Q2}
+
+\[
+\text{bf16}[B,D] \;\cdot\; \text{int8}[D,F] \;\longrightarrow\; \text{bf16}[B,F]
+\]
+
+\begin{align*}
+\text{total } \flops &= 2BFD \\
+\text{bytes moved} &= 2BD + DF + 2BF
+\end{align*}
+
+\[
+\AI = \frac{2BFD}{2BD + DF + 2BF} \quad (\text{assume } B \ll F, D) \;=\; 2B.
+\]
+
+At the corner of the roofline model:
+\[
+\text{Intensity}(\text{accel}) = \frac{1.97\mathrm{e}14 \; \flops}{8.2\mathrm{e}11 \; \text{bytes}}.
+\]
+
+\[
+2B = \text{Intensity}(\text{accel})
+\quad\Longrightarrow\quad
+B = \frac{1.97\mathrm{e}14}{2 \cdot 8.2\mathrm{e}11} \approx 120.
+\]
+
+\section*{Q3}
+
+Done on computer. Plot peak achievable FLOPs/s as a function of batch size for $F = D = 4096$ and $F = D = 1024$ (TPU v5e: $1.97 \times 10^{14}$ \flopss, $8.2 \times 10^{11}$ \bytesps).
+
+\lstinputlisting[style=pythonstyle]{q3.py}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.75\linewidth]{q3_graph.png}
+  \caption*{Peak FLOPs/s vs.\ batch size. Blue: $F = D = 4096$. Orange: $F = D = 1024$. Both saturate at the accelerator peak ($1.97 \times 10^{14}$ \flopss); the larger matmul ($D = 4096$) reaches the corner of the roofline at a smaller batch size.}
+\end{figure}
+
+\section*{Q4}
+
+\[
+\text{int8}[B,D] \;\cdot\; \text{int8}[B,D,F] \;\longrightarrow\; \text{int8}[B,F]
+\]
+
+(Per-batch matmul: for each $b$, a length-$D$ vector multiplies a $D \times F$ matrix.)
+
+\begin{align*}
+\flops &= BF(2D) = 2DBF \\
+\text{bytes} &= BD + BDF + BF \\
+\AI &= \frac{2DBF}{BD + BDF + BF}
+\end{align*}
+
+\section*{Q5}
+
+H100 SXM specs:
+\begin{align*}
+\text{bf16:} &\quad \underbrace{1.979 \times 10^{15} \; \flopss}_{\text{w/ sparsity}}
+\;\Longrightarrow\; \text{true value: } \frac{1.979}{2} \times 10^{15} \; \flopss \\
+\text{bw:} &\quad 3.35 \times 10^{12} \; \bytesps
+\end{align*}
+
+$\AI(\text{matmul}) = B$ \quad (assuming small $B$).
+
+\[
+B_{\text{compute-bound}}
+= \left\lfloor \frac{\frac{1.979}{2} \times 10^{15} \; \flopss}{3.35 \times 10^{12} \; \bytesps} \right\rfloor
+\approx 295 \text{ tokens} \quad (\text{rounding down}).
+\]
+
+\end{document}

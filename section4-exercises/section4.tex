@@ -1,0 +1,235 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{cancel}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+
+\title{Scaling Book --- Section 4 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Q1}
+
+$D = 4096$, $F = 4D$, $V = 32{,}000$, $L = 64$, $NH = D$.
+Assuming gating-einsum-type MLP and vanilla MHA ($N = K$).
+
+\subsection*{(i)}
+
+\[
+\text{Per-layer params} \;\approx\; \underbrace{3DF}_{\text{MLP}} \;+\; \underbrace{2D(N+K)H}_{\text{attn}} \;+\; \underbrace{D}_{\text{layer norm}}
+\]
+
+\begin{align*}
+\text{Total} &= L\big(3DF + 2D(N+K)H + D\big) \;+\; \underbrace{2DV}_{\substack{\text{embed + unembed} \\ (\text{vocab} \,\cdot\, \text{hidden dim size})}} \\
+&= L(3DF + 4DNH + D) + 2DV \\
+&= L(3DF + 4D^2 + D) + 2DV \\
+&= 64 \cdot (3 \cdot 4096 \cdot 4 \cdot 4096 + 4 \cdot 4096^2 + 4096) + 2 \cdot 4096 \cdot 32000 \\
+&\approx 17\text{B params.}
+\end{align*}
+
+\subsection*{(ii)}
+
+\[
+\frac{\text{attn params}}{\text{total params}}
+= \frac{4DNH}{4DNH + 3DF + D}
+\approx \frac{4D^2}{4D^2 + 12D^2}
+= \frac{1}{4}.
+\]
+
+\subsection*{(iii)}
+
+\[
+\underbrace{2}_{\substack{\text{keys} \\ \text{and vals}}}
+\cdot \underbrace{L}_{\substack{\#\text{ of} \\ \text{layers}}}
+\cdot \underbrace{N}_{\substack{\text{kv heads} \\ \text{per layer}}}
+\cdot \underbrace{H}_{\substack{\text{hidden dim} \\ \text{per index}}}
+= 2LD
+= 2 \cdot 64 \cdot 4096
+= 524{,}288 \text{ bytes}
+\;\approx\; 524 \text{ kB/token.}
+\]
+
+\section*{Q2}
+
+$A[B_x, D_y] \cdot W[D_y, F]$, \quad $\text{mesh} = \{X{:}4,\; Y{:}8,\; Z{:}4\}$.
+
+\subsection*{(i)}
+Replicated across $z$-axis so each $z$-axis ``layer'' does full matmul.
+\[
+\flops_{\text{Total}} = Z \cdot 2BDF = 2BDFZ.
+\]
+
+\subsection*{(ii)}
+Excluding reduction cost from AllReduce:
+\[
+\flops / \text{TPU} = \frac{2BDF}{XY}.
+\]
+
+\section*{Q3}
+
+\[
+A[I, J, K, L] \cdot B[I, J, M, N, O] \to C[K, L, M, N, O].
+\]
+
+Dimensions $I$, $J$ are contracting and there are no batching dimensions.
+
+\[
+\flops_{\text{Total}} = 2IJKLMNO.
+\]
+
+\section*{Q4}
+
+(Forward pass only, bf16) \quad
+\emph{(factor of $\tfrac{1}{2}$ from self-attn ignored in big-$\mathcal{O}$)}
+
+\[
+\flops = 2BTSKGH + \mathcal{O}(BTSN) + 2BTSKGH = 4BTSNH + \mathcal{O}(BTSN).
+\]
+
+Comp order: load $Q$, $K$, $V$ from HBM, compute $\text{softmax}(QK^T) \cdot V$ and write back to HBM. (No loading/storing intermediate results from matmuls and softmax.)
+
+\begin{align*}
+\text{Bytes} &= 2 \cdot BTNH + 2 \cdot BSKH + 2 \cdot BSKH + 2 \cdot BTNH \\
+             &= 4BTNH + 4BSKH = 4BTKGH + 4BSKH \\
+             &= 4BKH(TG + S).
+\end{align*}
+
+\[
+\text{AI} = \frac{4BTSNH + \mathcal{O}(BTSN)}{4BKH(TG + S)}
+\;\approx\; \frac{4BTSKGH}{4BKH(TG + S)}
+= \frac{TSG}{TG + S}
+= \frac{TG}{\tfrac{TG}{S} + 1}.
+\]
+
+\paragraph{Prefill / training time ($S = T$):}
+\[
+\text{AI} = \frac{TG}{\tfrac{TG}{T} + 1} = \frac{TG}{G + 1} \quad (\text{almost always compute bound}).
+\]
+
+\paragraph{Decode (inference-time, $T = 1$, kv-cache full):}
+\[
+\text{AI} = \frac{G}{\tfrac{G}{S} + 1} \;\Rightarrow\; \lim_{S \to \infty} \text{AI} = G.
+\]
+Our \# of query groups is small so during decode we're always comm bound.
+
+\section*{Q5}
+
+\[
+\flops_{\text{self-attn}} = 4BTSNH + \mathcal{O}(BTSN) \;\approx\; 4BTSNH.
+\]
+(Assuming vanilla MHA, $K = N$, $NH = D$.)
+
+\begin{align*}
+\flops_{\text{proj}} &= 4BTD(N + K)H = 4BTD \cdot (2N) \cdot H = 8BTD^2.
+\end{align*}
+
+\[
+\flops_{\text{self-attn}} = 4BTSD \;\geq\; \flops_{\text{proj}} = 8BTD^2
+\]
+\[
+\Rightarrow\; 4BTSD \geq 8BTD^2 \;\Rightarrow\; 4S \geq 8D \;\Rightarrow\; S \geq 2D.
+\]
+
+Assuming $D = 4096$:
+\[
+S \geq 8192.
+\]
+Only at large sequence lengths do attn-flops dominate.
+
+\section*{Q6}
+
+Save:
+\[
+Q[B,T,N,H],\; K[B,S,K,H],\; V[B,S,K,H],\; W_1[B,T,F],\; W_2[B,T,F],\; W_3[B,T,D],\; O[B,T,D].
+\]
+
+Going backwards through the attn comp graph (figure in section with postnorm):
+
+\paragraph{For $\partial \ell / \partial W_{\text{out}}$, we need to rematerialize:}
+\[
+\sigma(W_1) * W_2 \;\Rightarrow\; \mathcal{O}(BTF) \;\flops.
+\]
+
+\paragraph{For $\partial \ell / \partial W_{\text{In1}}$ and $\partial \ell / \partial W_{\text{In2}}$, we need to rematerialize:}
+\[
+\text{layernorm}_p(x + O[B, T, D]) \;\Rightarrow\; \mathcal{O}(BTD) \;\flops.
+\]
+
+\paragraph{For $\partial \ell / \partial W_o$, need:}
+\begin{align*}
+\text{softmax}(Q \cdot K) \cdot V \;&\Rightarrow\; 2BTSKGH + \mathcal{O}(BTSKG) + 2BTSKGH \;\flops \\
+&\approx\; 4BTSNH \;\flops \\
+&\text{(during training, $T = S$)} \\
+&= 4BT^2 NH \;\flops.
+\end{align*}
+
+\paragraph{For $\partial \ell / \partial W_Q$, $\partial \ell / \partial W_K$, $\partial \ell / \partial W_v$, $\partial \ell / \partial W_o$:}
+No rematerialization needed.
+
+\[
+\Rightarrow\; \flops_{\text{Total, remat}} = 4BT^2 NH + \mathcal{O}(BTD) + \mathcal{O}(BTF) \;\flops.
+\]
+
+\section*{Q7}
+
+Trained for $2.79$M H800 hrs on $14.8$T tokens. $37$B activated params, w/ FP8 FLOPs, no structured sparsity.
+
+\[
+\flops_{\text{Total}} = 6 \cdot 37\text{B} \cdot \underbrace{14.8\text{T}}_{\substack{\text{repeated tokens (multiple epochs)} \\ \text{are included in this count}}}
+\]
+
+\begin{align*}
+\left(\flopss\right)_{\text{utilized}}
+&= \frac{6 \cdot 37\text{B} \cdot 14.8\text{T}}{2.79\text{M hrs}}
+= \frac{(6 \cdot 37 \cdot 14.8) \cdot 10^{21}}{2.79 \cdot 10^6 \cdot 60 \cdot 60} \\
+&\approx 3.27 \times 10^{14} \;\flopss.
+\end{align*}
+
+\[
+\left(\flopss\right)_{\substack{\text{peak, H800, FP8} \\ \text{no sparsity}}} \approx 1.5 \times 10^{15} \;\flopss.
+\]
+
+\[
+\Rightarrow\; \frac{3.27 \times 10^{14}}{1.5 \times 10^{15}} = 0.218 \;\Rightarrow\; 21.8\% \;\text{hardware utilization.}
+\]
+
+\section*{Q8}
+
+$X[B, D]$ (flattened), $E\underbrace{[D, F]}_{\text{each expert}}$, $k$ activated experts per token, int8.
+
+\begin{align*}
+\flops &= 2BDF \cdot k \\
+\text{bytes} &= EDF \quad \substack{\text{(need to load all experts and then route} \\ \text{each token to selected)}} \\
+&\quad \text{(assuming input is already loaded)}
+\end{align*}
+
+\[
+\Tcomp \;\geq\; \Tcomm
+\]
+\[
+\Rightarrow\; \frac{2BDFk}{\underbrace{\text{accel }\flopss}_{C}} \;\geq\; \frac{EDF}{\underbrace{\text{accel bw}}_{W}}
+\;\Rightarrow\; \frac{2Bk}{C} \geq \frac{E}{W}
+\;\Rightarrow\; B \geq \frac{CE}{2kW}.
+\]
+
+On TPU v5e with $k = 8$, $E = 256$:
+\[
+B \;\geq\; \frac{(3.94 \times 10^{14}) \cdot 256}{2 \cdot 8 \cdot 8 \cdot (2 \cdot 10^{11})} \;=\; 3940.
+\]
+
+\end{document}
