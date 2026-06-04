@@ -1,0 +1,272 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{cancel}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Ttrain}{T_{\text{train}}}
+\newcommand{\Wici}{W_{\text{ici}}}
+\newcommand{\Wdcn}{W_{\text{dcn}}}
+
+\title{Scaling Book --- Section 6 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{LLaMA Case-study problems: Counting params / FLOPs}
+
+\subsection*{Q1}
+
+\[
+\text{Attn params} = \underbrace{DNH + DKH + DKH + NHD}_{\text{projs}} + \underbrace{D}_{\text{layernorm}}.
+\]
+\[
+\text{MLP} = 2DF + FD.
+\]
+\begin{align*}
+\text{Total} &= 2DV + (2DNH + 2DKH + D + 3FD) \cdot L \\
+&= 2 \cdot 8192 \cdot 128256 + \big(2 \cdot 8192 \cdot 64 \cdot 128 + 2 \cdot 8192 \cdot 8 \cdot 128 + 8192 + 3 \cdot 28672 \cdot 8192\big) \cdot 80 \\
+&= 7 \times 10^{10} = 70\text{B params.}
+\end{align*}
+
+\begin{align*}
+\text{Total}_{\text{Attn}}  &\approx 12 \cdot 10^9 = 12\text{B params,} \\
+\text{Total}_{\text{MLP}}   &\approx 56.4 \cdot 10^9 = 56\text{B params,} \\
+\text{Total}_{\text{vocab}} &\approx 2\text{B params.}
+\end{align*}
+
+\emph{Note:} MLP params account for most of the model's weights so we can ignore all other params when reasoning about memory / FLOPs. (Can use simplified transformer layer from prev section.)
+
+\subsection*{Q2}
+
+\[
+\flops / \text{token} = 6 \cdot 70\text{B} = 420 \cdot 10^9 \;\flops.
+\]
+If we're compute bound $+$ MFU $= 1$, in bf16 on 1 TPU:
+\[
+\Tcomp = \frac{420 \cdot 10^9 \;\flops}{4.59 \cdot 10^{14} \;\flopss} \approx 10 \cdot 10^{-4} = 1\,\text{ms}.
+\]
+
+\subsection*{Q3}
+
+\[
+\flops_{\text{Total}} = 6 \cdot 70\text{B} \cdot 15\text{T} = 6 \cdot 70 \cdot 10^9 \cdot 15 \cdot 10^{12} = 6.3 \cdot 10^{24}.
+\]
+Assuming compute bound w/ MFU $= 1$, bf16 on a single v5p:
+\[
+\Tcomp = \frac{6.3 \cdot 10^{24}}{4.59 \cdot 10^{14}} = 1.37 \cdot 10^{10}\,\text{s}.
+\]
+
+\subsection*{Q4}
+
+\[
+\Tcomp = \frac{6.3 \cdot 10^{24}}{8960 \cdot 4.59 \cdot 10^{14} \cdot 0.4} \approx 3.8 \cdot 10^6\,\text{s}.
+\]
+
+\subsection*{Q5}
+
+\begin{align*}
+\text{Bytes}_{\text{params}} &= 70\text{B} \cdot 2 = 140 \cdot 10^9 \\
+\text{Bytes}_{\text{opt}}    &= 2 \cdot 4 \cdot 70\text{B} = 560 \cdot 10^9
+\end{align*}
+(Assuming each checkpoint is of activations size)
+\begin{align*}
+\text{Bytes}_{\text{ckpt}} &= 2 \cdot B \cdot D \cdot L = 2 \cdot 4 \cdot 10^6 \cdot 8192 \cdot 80 \cdot 4 \\
+                            &= 5.24 \cdot 10^{12} \cdot 4 \approx 20.9\text{ TB.}
+\end{align*}
+
+\[
+\text{Total} = 140\text{ GB} + 560\text{ GB} + 20.9\text{ TB} = 21.6\text{ TB.}
+\]
+
+\[
+\#\,\text{TPUs}_{\min} = \frac{21.6 \cdot 10^3 \;\cancel{\text{GB}}}{96\,\cancel{\text{GB}}} = 225\text{ TPUs.}
+\]
+
+\subsection*{Q6}
+
+\[
+\text{Bytes / chip} = \frac{21.6 \cdot 10^{12}}{8960} = 2.4 \cdot 10^9 = 2.4\text{ GB.}
+\]
+
+\section*{Sharding LLaMA 3-70B for training}
+
+\subsection*{Q7}
+
+With no context / sequence parallel, we can only utilize $4 \cdot 10^6 / 4096 \approx 976$ chips. Pure FSDP is not possible here.
+
+We could technically still do it over 976 chips only but it would be a waste for the rest.
+
+\subsection*{Q8}
+
+\[
+\text{BS}_{\text{local}} = \frac{4 \cdot 10^6}{8960} \approx 446.
+\]
+\[
+\frac{C}{3 \cdot \Wici} = \frac{2550}{3} \approx 833.
+\]
+$446 < 833$ so we would be comm-bounded. FSDP only is still not a good idea.
+
+\subsection*{Q9}
+
+\[
+\frac{X^2}{M_x M_y F} = \frac{(2550)^2}{2 \cdot 28672} \approx 113.
+\]
+\[
+\frac{B}{N} = 446 > 113 \;\text{so w/ FSDP$+$TP we can be compute-bounded.}
+\]
+\[
+X_{\text{opt}} = \sqrt{\frac{B}{F} \cdot \frac{M_x}{M_y} \cdot N}.
+\]
+Choose $M_x = 2$, $M_y = 1$:
+\[
+X_{\text{opt}} = \sqrt{\frac{(4 \cdot 10^6)}{28672} \cdot 2 \cdot 8960} \approx 1502.
+\]
+\[
+\Rightarrow \text{2048-way FSDP and 4-way TP.}
+\]
+
+\section*{Worked Problems}
+
+\subsection*{1) $N = 4 \cdot 8960 = 35840$}
+
+When scaling up to multiple pods, we would use pure dp across the pods (we want minimal comm over dcn) and a different parallelism scheme within each pod depending on the new per-pod batch size.
+
+\[
+\text{BS}_{\text{local}} = \frac{4 \cdot 10^6}{4} = 1 \cdot 10^6.
+\]
+
+w/ pure TP in each pod:
+\[
+\frac{F}{8960} = \frac{28672}{8960} \;<\; \frac{2550}{3} \quad (\text{comm-bounded}).
+\]
+
+TP $+$ FSDP:
+\[
+\frac{B_{\text{local}}}{N} = 111 \;<\; \frac{2550^2}{2F} = 113.
+\]
+
+Between 4-pods, within each pod we are now comm bounded regardless of what parallelism scheme we choose.
+
+\paragraph{In the intra-pod level, setting $M_x = 2$, $M_y = 1$:}
+\[
+X_{\text{opt}} = \sqrt{\frac{B_{\text{local}}}{F} \cdot \frac{M_x}{M_y} \cdot N} = \underbrace{\tfrac{1}{2} \cdot 1502 = 751}_{\substack{\text{b/c our batchsize decreases} \\ \text{by $\tfrac{1}{4}$ which we pull out of the sqrt}}}.
+\]
+\[
+\Rightarrow \text{Rounding to the nearest power of 2 gives 512-way FSDP and 16-way TP. (We have chips left over though.)}
+\]
+
+\paragraph{At the inter-pod level:}
+\[
+\Tcomm = \frac{2 \cdot 2 \cdot 2 \cdot DF}{M \cdot \Wdcn}, \qquad \Tmath = \frac{4 \cdot 2BDF}{N \cdot C}.
+\]
+\[
+\Tmath > \Tcomm \;\Rightarrow\; \frac{\cancel{8}BDF}{NC} > \frac{\cancel{8}DF}{M \Wdcn} \;\Rightarrow\; \frac{B \cdot M}{N} > \frac{C}{\Wdcn}.
+\]
+\[
+\frac{4 \cdot 10^6}{4} > 71{,}360.
+\]
+We will be compute-bounded over dcn.
+
+Assuming MFU $= 1$, looking at inter-node level and assuming perfect overlap of comp and comm intra-node. Also ignoring that we technically don't use all chips in above parallelism.
+\[
+\Ttrain = \frac{6 \cdot 70\text{B} \cdot 15\text{T}}{4 \cdot 8960 \cdot 4.59 \cdot 10^{14}}
+        = \frac{6 \cdot 70 \cdot 10^9 \cdot 15 \cdot 10^{12}}{4 \cdot 8960 \cdot 4.59 \cdot 10^{14}} \approx 3.8 \cdot 10^5\,\text{s}.
+\]
+
+\subsection*{2) Larger model}
+
+\paragraph{a) i) Hyperparam table:}
+
+\begin{center}
+\begin{tabular}{l|l}
+\textbf{hyperparam} & \textbf{value} \\ \hline
+n\_layers ($L$)     & 126 \\
+d\_model ($D$)      & 16384 \\
+$d_{ff}$ ($F$)      & 53248 \\
+n\_heads ($N$)      & 128 \\
+n\_kv\_heads ($K$)  & 8 \\
+d\_qkv ($H$)        & $D/N = 16384/128 = 128$ \\
+n\_embeddings ($V$) & 128256 \\
+\end{tabular}
+\end{center}
+
+\paragraph{ii) Per layer:}
+\[
+\text{Attn} = DNH + DKH + DKH + NHD + D = 2DNH + 2DKH + D \approx 2DNH + 2DKH.
+\]
+\[
+\text{MLP} = 2DF + FD = 3DF.
+\]
+\begin{align*}
+\text{Total} &= (2DNH + 2DKH + 3DF) \cdot L + 2DV \\
+&= \big(2 \cdot 16384 \cdot 128 \cdot 128 + 2 \cdot 16384 \cdot 8 \cdot 128\big) \cdot 126 \\
+&\quad + 3 \cdot 16384 \cdot 53248 + 2 \cdot 16384 \cdot 128256 \\
+&= 4.05 \cdot 10^{11} = 405 \cdot 10^9 \text{ params.}
+\end{align*}
+
+\paragraph{iii)}
+\[
+\flops / \text{Token} = 6 \cdot 405 \cdot 10^9 = 2.43 \cdot 10^{12}.
+\]
+
+\paragraph{iv)}
+\[
+\flops_{\text{Total}} = 2.43 \cdot 10^{12} \cdot 15 \cdot 10^{12} = 3.645 \cdot 10^{25}.
+\]
+
+\paragraph{b)} Assuming the actual sequence lengths are $< 8D$ so that attn costs are negligible and that our batch size is $4$ mil.
+
+\paragraph{Across the pods I would use pure DP} (minimize comm times over dcn):
+\[
+\frac{B \cdot M}{N} = \frac{4 \cdot 10^6}{8} = 5 \cdot 10^5 > \frac{C}{\Wdcn} = 73440
+\;\Rightarrow\; \text{compute bound over dcn.}
+\]
+
+\paragraph{At the intra-pod level:}
+Pure-DP will not work since model params alone are $405 \cdot 10^9 \cdot 2 = 810$ GB $\gg 96$ GB HBM / v5p.
+
+\paragraph{Trying pure FSDP:}
+\[
+\frac{B_{\text{local}}}{8960} = \frac{(4 \cdot 10^6 / 8)}{8960} \approx 55 \;<\; \frac{2550}{3} = 850.
+\]
+We can't use pure FSDP since we'll be comm-bound.
+
+\paragraph{FSDP$+$TP (Let $M_x = 2$, $M_y = 1$):}
+\[
+\frac{B_{\text{local}}}{N} = \frac{(4 \cdot 10^6 / 8)}{8960} \approx 55.
+\]
+\[
+\frac{X^2}{M_x M_y F} = \frac{2550^2}{2 \cdot 53248} \approx 61.
+\]
+We will still be slightly comm-bounded.
+
+\[
+X_{\text{opt}} = \sqrt{\frac{B_{\text{local}}}{F} \cdot \frac{M_x}{M_y} \cdot N}
+              = \sqrt{\frac{(4 \cdot 10^6 / 8)}{53248} \cdot 2 \cdot 8960} \approx 410.
+\]
+
+Closest power of 2 (for wraparound ici) gives us: 448-way FSDP and 20-way TP.
+
+\paragraph{Assuming MFU $= 1$:}
+\[
+\Ttrain = \frac{6 \cdot 405 \cdot 10^9 \cdot 15 \cdot 10^{12}}{8 \cdot 8960 \cdot 4.59 \cdot 10^{14}}
+        \approx 1 \cdot 10^6\,\text{s} \approx 12\,\text{days.}
+\]
+
+\end{document}

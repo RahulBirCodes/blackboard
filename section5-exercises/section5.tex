@@ -1,0 +1,132 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Wici}{W_{\text{ici}}}
+
+\title{Scaling Book --- Section 5 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Q1}
+
+\[
+\text{Attn params} = \underbrace{DNH + 2DKH + NHD}_{\text{attn projs}} + \underbrace{D}_{\text{layernorm}}
+\]
+\[
+= DNH + 2DNH + DNH + D = 4DNH + D.
+\]
+\[
+\text{MLP params} = 2DF + FD = 3DF.
+\]
+
+\begin{align*}
+\text{Total} &= (4DNH + D + 3DF) \cdot L + 2DV \\
+&= (4 \cdot 5120 \cdot 40 \cdot 128 + 5120 + 3 \cdot 5120 \cdot 13824) \cdot 40 + 2 \cdot 5120 \cdot 32000 \\
+&\approx 13 \times 10^9 = 13\text{B params.}
+\end{align*}
+
+\section*{Q2}
+
+$\text{BS} = 16$M tokens, using Adam, store params in bf16, opt state in fp32, checkpoint act 3 times/layer.
+
+\begin{align*}
+\text{Param mem} &= 2 \cdot 13 \times 10^9 \text{ bytes} \\
+\text{Opt mem}   &= \underbrace{4 \cdot 13 \times 10^9 + 4 \cdot 13 \times 10^9}_{\text{1st + 2nd moment}} \\
+\text{Act ckpt mem} &= 2L \cdot \big( \underbrace{2BF}_{\substack{\text{gating} \\ \text{up projs}}} + \underbrace{BD}_{\text{down proj}} \big) = 2LB(2F + D) \\
+&= 2 \cdot 40 \cdot 16 \cdot 10^6 \cdot (2 \cdot 13824 + 5120).
+\end{align*}
+
+\[
+\text{Total} = \text{Param} + \text{Opt} + \text{Act} \;\approx\; 4.2 \times 10^{13} \text{ bytes} = 42\text{TB}.
+\]
+
+\section*{Q3}
+
+Train with:
+\begin{itemize}[leftmargin=*]
+  \item $T = 32$K
+  \item $\text{BS} = 3$M
+  \item on TPU v5p $16 \times 16 \times 16$ slice (has wraparound conns)
+  \item bf16 weights, fp32 optimizer
+\end{itemize}
+
+\subsection*{(i)}
+
+From prev q, assuming Adam optimizer, the model weights + opt state is $130$ GB $> 96$ GB which is the v5p's memory capacity.
+
+\subsection*{(ii)}
+
+With ZeRO-3 type FSDP, we have no duplicated data.
+
+\begin{align*}
+\text{Bytes}_{\text{Total}} &= (10 \cdot 13 \cdot 10^9) + 2LB(2F + D) \\
+&= (10 \cdot 13 \cdot 10^9) + 2 \cdot 40 \cdot (3 \cdot 10^6) \cdot (2 \cdot 13824 + 5120) \\
+&\approx 7.99 \cdot 10^{12} \text{ bytes} \approx 8 \text{TB}.
+\end{align*}
+
+Total v5p $16 \times 16 \times 16$ slice has $16^3 \cdot 96$ GB $= 393$ TB, so we are in the hbm limit. Each device will have $(8 \text{TB})/16^3 \approx 1.96$ GB used. \quad ($X = 16^3$)
+
+\[
+\Tcomm = \frac{2 \cdot 2DF}{3 \cdot \Wici}, \qquad \Tmath = \frac{2 \cdot 2BDF}{X \cdot C}.
+\]
+
+\[
+\Rightarrow \frac{B}{X} = \frac{3 \cdot 10^6}{16^3} = 732 \;<\; \frac{4.59 \cdot 10^{14}}{3 \cdot 1.8 \cdot 10^{11}} = 850.
+\]
+
+Using pure FSDP, while it is possible, we will be comm bounded so it's better to try FSDP$+$TP.
+
+\subsection*{(iii)}
+
+\paragraph{a)} To be compute bound:
+\[
+\frac{B}{N} \;>\; \frac{X^2}{\underbrace{M_x M_y F}_{\text{2 for 3D mesh}}}
+= \frac{(2550^2)}{2 \cdot 13824} \approx 235.
+\]
+\[
+\frac{B}{N} = 850 > 235, \text{ so we can use FSDP}+\text{TP.}
+\]
+
+\paragraph{b)} Choosing $M_x$, $M_y$ doesn't matter $\Rightarrow$ just changes $X_{\text{opt}}$.
+
+Let $M_x = 2$, $M_y = 1$.
+\[
+X_{\text{opt}} = \sqrt{\frac{B}{F} \cdot \frac{M_x}{M_y} \cdot N} = \sqrt{\frac{3 \cdot 10^6}{13824} \cdot 2 \cdot 16^3} \approx 1333.
+\]
+\[
+\Rightarrow \text{mesh} = \{X{:}1024,\; Y{:}4\} \quad \underbrace{}_{\text{need int + want wraparounds}}
+\]
+
+FSDP$+$TP sharding:
+\[
+\text{In}[B_x, D_y] \cdot_D W_{\text{in}}[D_x, F_y] \cdot_F W_{\text{out}}[F_y, D_x] \to \text{Out}[B_x, D_y].
+\]
+
+Per device mem $= 1.96$ GB \quad (same as pt b since there's no data duplication).
+
+\paragraph{c)} No redundant comp w/ FSDP$+$TP:
+\[
+\flops_{\text{Total}} = 6 \cdot 13\text{B} \cdot 3\text{M} = 6 \cdot 13 \cdot 10^9 \cdot 3 \cdot 10^6.
+\]
+\[
+\Tcomp = \frac{(6 \cdot 13 \cdot 10^9 \cdot 3 \cdot 10^6)}{16^3 \cdot 4.59 \cdot 10^{14} \cdot 0.4} = 0.3.
+\]
+
+\end{document}
