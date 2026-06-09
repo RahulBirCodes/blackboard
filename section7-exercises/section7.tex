@@ -1,0 +1,288 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Wici}{W_{\text{ici}}}
+\newcommand{\Whbm}{W_{\text{hbm}}}
+
+\title{Scaling Book --- Section 7 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Pop Quiz}
+
+Take gen step on BS of 4 tokens on 30B param dense model on TPU v5e $4 \times 4$ slice in int8 w/ bf16 FLOPs, 8192 context, 100 kB/token KV caches.
+
+\subsection*{(i)}
+
+\[
+T_{\text{min,step}} = \frac{4 \cdot 100 \cdot 10^3 \cdot 8192}{4 \cdot 4 \cdot 8.2 \cdot 10^{11}} + \max\!\left( \underbrace{\frac{2 \cdot 4 \cdot 30 \cdot 10^9}{4 \cdot 4 \cdot 1.97 \cdot 10^{14}}}_{7.6 \cdot 10^{-5}\text{ s}},\; \underbrace{\frac{30 \cdot 10^9}{4 \cdot 4 \cdot 8.2 \cdot 10^{11}}}_{2.2 \text{ ms}} \right)
+\]
+\[
+\approx 2.5 \text{ ms.}
+\]
+
+MLPs are comm-bounded.
+
+We could also see this since our total token BS is 4 per fwd pass $\ll B_{\text{crit}} = 240$.
+
+\subsection*{(ii)}
+
+$B = 256 > B_{\text{crit}} = 240 \Rightarrow$ MLPs are comp bound.
+
+For thoroughness:
+\[
+T_{\text{min,step}} = \underbrace{\frac{256 \cdot 100 \cdot 10^3 \cdot 8096}{16 \cdot 8.2 \cdot 10^{11}}}_{\approx\, 16 \text{ ms}} + \max\!\left( \underbrace{\frac{2 \cdot 256 \cdot 30 \cdot 10^9}{16 \cdot 1.97 \cdot 10^{14}}}_{\approx\, 4.9 \text{ ms}},\; \underbrace{\frac{30 \cdot 10^9}{16 \cdot 8.2 \cdot 10^{11}}}_{\approx\, 4.6 \text{ ms}} \right)
+\]
+\[
+= 20.9 \text{ ms}.
+\]
+
+\section*{Q1}
+
+\subsection*{(i)}
+
+Per layer:
+\begin{align*}
+\text{Attn:} \quad & 2DNH + 2DKH + D \;\approx\; 2DNH + 2DKH \\
+\text{MLP:}  \quad & 3DF
+\end{align*}
+
+\begin{align*}
+\text{Total} &= L(2DNH + 2DKH + 3DF) + DV \\
+&= 64 \cdot (2 \cdot 4096 \cdot 32 \cdot 256 + 2 \cdot 4096 \cdot 8 \cdot 256 + 3 \cdot 4096 \cdot 16384) \\
+&\quad + 4096 \cdot 32128 \;\approx\; 18.4\text{B params.}
+\end{align*}
+
+\subsection*{(ii)}
+
+\[
+\text{KV cache size/token} = 2 \cdot H \cdot K \cdot L = 2 \cdot 256 \cdot 8 \cdot 64 = 262{,}144 \text{ bytes} \approx 262 \text{ kB}.
+\]
+
+\section*{Q2}
+
+Serve on TPU v5e $4 \times 4$ slice. int8, $T = 128$K.
+
+\subsection*{(i)}
+
+\begin{align*}
+\text{KV Cache Size/seq} &= 2HKLT = 2 \cdot 256 \cdot 8 \cdot 64 \cdot 128 \cdot 10^3 \\
+&\approx 3.4 \cdot 10^{10} \text{ bytes} = 34 \text{ GB}.
+\end{align*}
+
+\[
+\text{Model size} = 18.4 \cdot 10^9 \text{ bytes} = 18.4 \text{ GB}.
+\]
+\[
+\text{Total mem} = 16 \cdot 16 \text{ GB} = 256 \text{ GB}.
+\]
+\[
+\text{BS}_{\max} = \frac{256 - 18.4}{34} \approx 7.
+\]
+
+\subsection*{(ii)}
+
+Dropping $K = 1$ scales down KV cache size/token by $\frac{1}{8} \Rightarrow \text{BS}_{\max} = 8 \cdot 7 = 56$.
+
+\section*{Q3}
+
+\[
+\frac{\text{Model Size}}{(\text{\# devices}) \cdot \Whbm} = \frac{18.4 \cdot 10^9}{16 \cdot 8.2 \cdot 10^{11}} \approx 1 \text{ ms} \quad \text{(assuming full utilization of HBM)}.
+\]
+
+\section*{Q4}
+
+What does ICI look like on a $4 \times 4$? $\Rightarrow$ 2 hardware axes, doubled bw.
+
+Roofline bound on TP:
+\[
+\frac{2 \cdot F}{\left(\frac{C}{\Wici}\right)} = \frac{2 \cdot 16384 \cdot 9.0 \cdot 10^{10}}{3.94 \cdot 10^{14}} = 7 < Y = 16.
+\]
+
+We are comm-bounded with TP only.
+
+\paragraph{Prefill:} From our TP roofline, if we use the whole slice for TP, we will be comm-bounded. What I would do is use 8-way TP which will still be slightly comm-bounded but right on the edge, with 2-way sequence parallelism.
+
+\paragraph{Generation:} For generation, our only option is model parallelism. Per layer, since a majority of the parameters are within the MLP (approximating by ignoring einsum):
+\[
+T_{\text{hbm comm}} = \frac{2DF}{16 \cdot \Whbm}, \qquad T_{\text{ici comm}} = \frac{2BD}{\Wici}.
+\]
+
+Want:
+\[
+T_{\text{ici comm}} < T_{\text{hbm comm}} \;\Rightarrow\; \frac{2BD}{\Wici} < \frac{2DF}{16 \cdot \Whbm}
+\]
+\[
+B < \frac{F \cdot \Wici}{16 \cdot \Whbm} = \frac{16384 \cdot 9.0 \cdot 10^{10}}{16 \cdot 8.2 \cdot 10^{11}}
+\]
+\[
+\Rightarrow B < 112
+\]
+Which will probably be true in practice since 112 is a pretty big batch size of requests to arrive at once.
+
+For generation, I'd use 16-way TP since we're already comm-bounded and as shown above at reasonable inference batch sizes our ici comm time will be less than the time to load from HBM $\to$ MXU. Since $K$ (\# of KV heads) is $< 16$ but divides it, I'd shard the KV cache along the head and batch dimensions.
+
+Under this sharding each chip would store $\frac{1}{16}$ of all the parameters so assuming BS = 1:
+\[
+\text{Step Time}_{\min} = \frac{(34 + 18.4) \cdot 10^9}{16 \cdot 8.2 \cdot 10^{11}} \approx 3 \text{ ms}.
+\]
+
+This comes from the fact that we're still bottlenecked by loading params from HBM and each device has roughly $(1/16)$ of the data.
+
+\section*{Q5}
+
+$E = 16$, $k = 2$.
+
+\subsection*{(i)}
+
+Per layer:
+\begin{align*}
+\text{Attn} &= 2DNH + 2DKH \\
+\text{MLP}_{\text{total}} &= 3DF \cdot E \\
+\text{MLP}_{\text{act}} &= 3DF \cdot k
+\end{align*}
+
+\begin{align*}
+\text{Total} &= 2DV + L \cdot (2DNH + 2DKH + 3DFE) \\
+&= 2 \cdot 4096 \cdot 32128 + 64 \cdot (2 \cdot 4096 \cdot 32 \cdot 256 \\
+&\quad + 2 \cdot 4096 \cdot 8 \cdot 256 + 3 \cdot 4096 \cdot 16384 \cdot 16) \\
+&\approx 211\text{B}.
+\end{align*}
+\begin{align*}
+\text{Activated} &= 2DV + L \cdot (2DNH + 2DKH + 3DFk) \\
+&\approx 31\text{B}.
+\end{align*}
+
+\subsection*{(ii)}
+
+Since MLP accounts for most of the FLOPs, we see the bs on a single device where we become comm bound for one of the matmuls (all 3 are the same size). Also assuming we're in generation and our sequence dim is trivial.
+
+\[
+\text{AI} = \frac{2BDFk}{2BD + 2DFE + 2BFk} \approx \frac{2BDFk}{2DFE} = B \cdot \frac{k}{E}.
+\]
+
+\[
+B \cdot \frac{k}{E} \geq \text{Intensity}(\text{v5e}) = 240
+\]
+
+\[
+\Rightarrow B \geq \frac{240 \cdot E}{k} = 1920.
+\]
+
+\subsection*{(iii)}
+
+The KV Cache size per token stays the same as 262 kB since MoE doesn't change the K, V projections.
+
+\subsection*{(iv)}
+
+Again, our linear projections dominate FLOPs so:
+\[
+\text{FLOPS} \approx 2 \cdot (\text{activated params}) \cdot T = 2 \cdot 31 \cdot 10^9 \cdot T = 62 \cdot 10^9 \cdot T.
+\]
+
+\section*{Q6}
+
+Each FFW weight sharded as $[E_z, D_x, F_y]$ ($z$ only used during training as FSDP dim).
+
+\subsection*{(i)}
+
+TPU v5e $8 \times 16$ slice, $Y = 8$, $Z = 16$, int 8.
+\[
+T_{\text{weights}} \approx \frac{211 \cdot 10^9}{8 \cdot 16 \cdot \Whbm} \approx 2 \text{ ms} \quad \text{(most parameters are in the MLPs so this is a good approximation)}.
+\]
+
+\[
+\text{Per chip mem used} = \left( \frac{211 \cdot 10^9}{8 \cdot 16} \right) \approx 1.65 \text{ GB}.
+\]
+\[
+\text{Remaining per chip mem} = 16 - 1.65 = 14.35 \text{ GB}.
+\]
+
+\subsection*{(ii)}
+
+Again, assuming weights are stored in int8:
+\[
+N_{\min} = \frac{211}{16} = 14 \text{ v5es} \;\Rightarrow\; 7 \times 2 \text{ slice} \quad \text{(no wraparound connections though)}.
+\]
+
+\section*{Q7}
+
+For 2D sharding:
+\[
+\Tmath = \left( \frac{2BDF}{XYZ} + \frac{2BDF}{XYZ} \right) \bigg/ C = \frac{4BDF}{CXYZ}.
+\]
+
+Assuming bf16, bidirectional ici:
+\[
+\Tcomm = \frac{2B \cdot \left( \frac{D}{X} \right)}{2 \cdot \Wici} + \frac{2 \cdot 2B \cdot \left( \frac{F}{YZ} \right)}{\Wici} + \frac{2B \cdot \left( \frac{D}{X} \right)}{2 \cdot \Wici}
+\]
+\[
+= \frac{4BD}{2X\Wici} + \frac{4BF}{YZ\Wici}.
+\]
+
+Since we are free to set the topology, we want to minimize $X, YZ$ (only the product matters for $\Tcomm$):
+\[
+YZ = N/X, \qquad X = N/YZ.
+\]
+\[
+\Tcomm = \frac{4BD}{2X\Wici} + \frac{4BFX}{N\Wici}.
+\]
+\[
+\frac{\partial \Tcomm}{\partial X} = \frac{-4BD}{2\Wici X^2} + \frac{4BF}{N\Wici} = 0
+\]
+\[
+\Rightarrow \frac{4BF}{N\Wici} = \frac{4BD}{2\Wici X^2} \;\Rightarrow\; X^2 = \frac{D}{2\Wici} \cdot \frac{N\Wici}{F} = \frac{ND}{2F}.
+\]
+\[
+X_{\text{opt}} = \sqrt{\frac{ND}{2F}}, \qquad YZ_{\text{opt}} = \frac{N}{X} = \sqrt{\frac{N^2 \cdot 2F}{ND}} = \sqrt{\frac{2FN}{D}}.
+\]
+
+Assuming $F = 4D$ like in specified model:
+\[
+X_{\text{opt}} = \sqrt{\frac{ND}{2 \cdot 4D}} = \sqrt{\frac{N}{8}}.
+\]
+
+\begin{align*}
+\Tcomm &= \frac{4BD}{2 \cdot \sqrt{N/8} \cdot \Wici} + \frac{4BF \cdot \sqrt{N/8}}{N \cdot \Wici} \\
+&= \frac{2BD}{\Wici \cdot \sqrt{N/8}} + \frac{16BD \cdot \sqrt{N/8}}{N \cdot \Wici} \\
+&= \frac{2BD}{\Wici} \cdot \left( \sqrt{\frac{8}{N}} + 8 \cdot \sqrt{\frac{N}{8N^2}} \right) \\
+&= \frac{2BD}{\Wici} \left( \sqrt{\frac{8}{N}} + \sqrt{\frac{64N}{8N^2}} \right) = \frac{4BD}{\Wici} \cdot \sqrt{\frac{8}{N}} \\
+&= \frac{\sqrt{128} \cdot BD}{\Wici \cdot \sqrt{N}}.
+\end{align*}
+
+For normal 3D model parallelism ($[D, F_{XYZ}]$):
+\[
+\Tmath = \frac{2BDF}{XYZ \cdot C} \cdot 2 = \frac{4BDF}{XYZ \cdot C}.
+\]
+\[
+\Tcomm = \frac{2 \cdot 2 \cdot BD}{3 \cdot \Wici} = \frac{4BD}{3\Wici}.
+\]
+
+The time for math comp is the same so we're looking for when:
+\[
+\Tcomm^{\,3D} > \Tcomm^{\,2D} \;\Rightarrow\; \frac{4BD}{3\Wici} > \frac{\sqrt{128} \cdot BD}{\Wici \cdot \sqrt{N}}
+\]
+\[
+\Rightarrow \sqrt{N} > \frac{3 \cdot \sqrt{128}}{4} \;\Rightarrow\; N > \frac{9 \cdot 128}{16} = 72.
+\]
+
+When we have more than 72 chips in our slice (assuming slice is chosen s.t. we have bidirectional ici over all axes), the 2D scheme will outperform the 3D one.
+
+\end{document}
