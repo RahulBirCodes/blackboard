@@ -1,0 +1,448 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Tstep}{T_{\text{step}}}
+\newcommand{\Tstepmin}{T_{\text{step,min}}}
+\newcommand{\Wici}{W_{\text{ici}}}
+\newcommand{\Whbm}{W_{\text{hbm}}}
+
+\title{Scaling Book --- Section 8 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Serving Llama Case-Study}
+
+\section*{Q1}
+
+\[
+\text{KV Cache Size/Token} = 2 \cdot H \cdot K \cdot L = 2 \cdot 128 \cdot 8 \cdot 80 \approx 164 \text{ kB}.
+\]
+
+\section*{Q2}
+
+$\text{BS} = 32$, $T = 8192$, int8.
+\[
+\text{Total mem} = 70 \cdot 10^9 + 32 \cdot 8192 \cdot 164 \cdot 10^3 \approx 113 \text{ GB}.
+\]
+\[
+N_{\min} = \frac{113}{16} = 8 \text{ v5es} \;\Rightarrow\; 4 \times 2 \text{ slice}.
+\]
+
+$N_{\min}$ is very tight so might need to bump to a larger size like $4 \times 4$ for other overheads/activations.
+
+\section*{Q3}
+
+FLOPs in bf16, everything is sharded.
+
+\subsection*{(i) On TPU v5e $4 \times 2$:}
+
+\[
+\Tstep = \underbrace{\frac{32 \cdot 8192 \cdot 164 \cdot 10^3}{8 \cdot 8.2 \cdot 10^{11}}}_{6.6 \text{ ms}} + \max\!\left( \underbrace{\frac{2 \cdot 32 \cdot 70 \cdot 10^9}{8 \cdot 1.97 \cdot 10^{14}}}_{2.8 \text{ ms}},\; \underbrace{\frac{70 \cdot 10^9}{8 \cdot 8.2 \cdot 10^{11}}}_{10.67 \text{ ms}} \right)
+\]
+\[
+\approx 17.27 \text{ ms.}
+\]
+
+\[
+\text{Throughput} = 32 \cdot \frac{1}{17.27 \cdot 10^{-3} \text{ s}} \approx 1855 \text{ tokens/s} = 232 \text{ tokens/s/chip}.
+\]
+
+\subsection*{(ii) $4 \times 4$:}
+
+Cuts above time in half $\Rightarrow \Tstep \approx 8.6$ ms.
+
+Throughput/chip stays the same as tokens/s doubles but so does \# chips.
+
+\paragraph{Note:} Above only looks at HBM $\to$ MXU time vs.\ comp time. Sharding requires ici comm which we need to ensure isn't the bottleneck. On both slices, we would do TP over both axes. However, neither slice will have wraparound axes along either axis, but for a back-of-the-envelope estimate, we're comp-bounded for:
+\[
+Y < \frac{M_y \cdot F}{2200} = \frac{2 \cdot 28672}{2200} \approx 26.
+\]
+
+ICI is not the bottleneck.
+
+For thoroughness, with no bidirectional bw for TP:
+\[
+\Tmath = \frac{4BDF}{Y \cdot C}, \qquad \Tcomm = \frac{2 \cdot \left( \frac{BD}{Y} \right) \cdot (Y - 1)}{\Wici} \quad \text{(unidirectional)}.
+\]
+\[
+\Tmath > \Tcomm \;\Rightarrow\; \frac{4BDF}{YC} > \frac{2BDY - 2BD}{Y \cdot \Wici}
+\]
+\[
+4BDF\Wici + 2BDC > 2BDCY \;\Rightarrow\; Y < \frac{4BDF\Wici + 2BDC}{2BDC}
+\]
+\[
+Y < \frac{2F\Wici + C}{C} \approx 14.
+\]
+
+TP is comm-bounded compared to ici, but compared to HBM load time:
+\[
+T_{\text{HBM comms}} = \frac{DF}{Y \cdot \Whbm}, \qquad T_{\text{ici comms}} = \frac{BD \cdot (Y - 1)}{Y \cdot \Wici} \quad \text{(unidirectional)}.
+\]
+\[
+T_{\text{HBM}} > T_{\text{ici}} \;\Rightarrow\; \frac{DF}{Y\Whbm} > \frac{BDY - BD}{Y\Wici} \;\Rightarrow\; \frac{\frac{2DF\Wici}{\Whbm} + BD}{BD} > Y
+\]
+\[
+\Rightarrow \frac{F\Wici}{\Whbm B} + 1 = 50 > Y.
+\]
+
+In both cases ($4 \times 2$, $4 \times 4$), the above inequality is true so our above latency/throughput calcs stay the same as ici is not our bottleneck.
+
+\section*{Thinking about throughput}
+
+\section*{Q4}
+
+\subsection*{(i)}
+
+bf16 weights and acts $\Rightarrow$ for any $[B,D] \cdot [D,F]$ matmul, $B \ll D, F$.
+\[
+\text{AI} = \frac{2BDF}{2(BD + DF + BF)} \approx \frac{2BDF}{2DF} = B.
+\]
+\[
+\Tmath > \Tcomm \;\Rightarrow\; \text{AI} > \text{Intensity}(\text{v5e}), \quad \text{AI} = B \geq 240.
+\]
+
+\subsection*{(ii)}
+
+\[
+B \geq 240 \cdot \frac{\text{bits per param}}{\text{bits per act}} = 240 \cdot \frac{8}{16} = 120.
+\]
+
+\subsection*{(iii)}
+
+\[
+B \geq 240 \cdot \frac{8}{8} = 240.
+\]
+
+\section*{Q5}
+
+Assuming negligible KV caches:
+
+\subsection*{(i) bf16}
+
+\[
+N = \frac{2 \cdot 70 \cdot 10^9}{16 \cdot 10^9} = 8.75 \;\Rightarrow\; 4 \times 4 \text{ slice}.
+\]
+\[
+\text{KV Cache Size} = 2 \cdot 2 \cdot H \cdot K \cdot L \cdot T \approx 2.6 \text{ GB.}
+\]
+\[
+\text{Max BS} \approx 44.
+\]
+
+\subsection*{(ii) int8}
+
+\[
+N = \frac{70 \cdot 10^9}{16 \cdot 10^9} = 4.4 \;\Rightarrow\; 2 \times 4 \text{ slice}.
+\]
+\[
+\text{KV Cache Size} = 2 \cdot HKLT \approx 1.3 \text{ GB.}
+\]
+\[
+\text{Max BS} = 44.
+\]
+
+\subsection*{(iii) int4}
+
+\[
+N = \frac{\frac{1}{2} \cdot 70 \cdot 10^9}{16 \cdot 10^9} = 2.2 \;\Rightarrow\; 2 \times 2 \text{ slice}.
+\]
+\[
+\text{KV Cache Size} = HKLT \approx 0.65 \text{ GB.}
+\]
+\[
+\text{Max BS} = 44.
+\]
+
+\section*{Q6}
+
+In any of the cases, the max BS we can fit $< B_{\text{crit}}$, so we're completely HBM bound. If we're using all the memory available, the min step time is the time to load the entire HBM $\to$ MXU:
+\[
+\Tstepmin = \frac{\text{v5e HBM}}{\text{v5e bw}} = \frac{16 \cdot 10^9}{8.2 \cdot 10^{11}} \approx 20 \text{ ms.}
+\]
+
+\paragraph{Takeaway $\Rightarrow$} Can always lower bound decode latency by time to load weights from HBM $\to$ MXU. Usually a good bound (up to $1.5\times$) unless large BS (comp-bound / KV loading time non-negligible) or lots of ici comm.
+
+\section*{Q7}
+
+\subsection*{(i) bf16, $4 \times 4$}
+
+\[
+\text{Max q/s/chip} = \frac{\text{BS}_{\max}}{\Tstepmin \cdot (\text{\# steps}) \cdot N} = \frac{44}{20 \cdot 10^{-3} \cdot 512 \cdot 16} \approx 0.27.
+\]
+
+\subsection*{(ii) int8, $2 \times 4$}
+
+\[
+\text{Max q/s/chip} = \frac{44}{20 \cdot 10^{-3} \cdot 512 \cdot 8} = 0.54.
+\]
+
+\subsection*{(iii) int4, $2 \times 2$}
+
+\[
+\text{Max q/s/chip} = \frac{44}{20 \cdot 10^{-3} \cdot 512 \cdot 4} = 1.07.
+\]
+
+\section*{Q8}
+
+Assuming 8K context and median decode len of 512.
+
+\subsection*{(i) bf16, now on $4 \times 8$ slice}
+
+\[
+\text{Mem for KV Cache} = 32 \cdot 16 - 2 \cdot 70 = 372 \text{ GB.}
+\]
+\[
+\text{BS}_{\max} = \frac{372 \cdot 10^9}{2.6 \cdot 10^9} \approx 143.
+\]
+\[
+\Tstepmin = \frac{16 \cdot 10^9}{8.2 \cdot 10^{11}} \approx 20 \text{ ms.}
+\]
+\[
+\text{Max q/s/chip} = \frac{143}{20 \cdot 10^{-3} \cdot 32 \cdot 512} = 0.44 \text{ s.}
+\]
+
+\subsection*{(ii) int8, now on $4 \times 4$}
+
+\[
+\text{Mem for KV Cache} = 16 \cdot 16 - 70 = 116.
+\]
+\[
+\text{BS}_{\max} = 143 \quad \text{(numerator and denom both halve).}
+\]
+\[
+\text{Max q/s/chip} = \frac{143}{20 \cdot 10^{-3} \cdot 16 \cdot 512} = 0.88 \text{ s.}
+\]
+
+\subsection*{(iii) int4, now on $4 \times 2$}
+
+\[
+\text{Max q/s/chip} = \frac{143}{20 \cdot 10^{-3} \cdot 8 \cdot 512} = 1.76 \text{ s.}
+\]
+
+\section*{Q9}
+
+Serve in bf16 on TPU v5e $4 \times 8$.
+
+We can only do TP, let's use all devices:
+\[
+\frac{2 \cdot 28672}{2200} \approx 26 < 32 \;\Rightarrow\; \text{we are comm-bound over ici.}
+\]
+
+However, we are likely going to be mem bd for MLPs anyways (at small BS), so comparing $T_{\text{hbm}}$ v. $T_{\text{ici}}$ (ignoring the fact we don't have bidir ici on this slice $\to$ just makes a more conservative lower bound):
+\[
+T_{\text{hbm}} = \frac{2DF}{32 \cdot \Whbm}, \qquad T_{\text{ici}} = \frac{2BD}{\Wici}.
+\]
+\[
+T_{\text{ici}} > T_{\text{hbm}} \;\Rightarrow\; \frac{2BD}{\Wici} > \frac{2DF}{Y \cdot \Whbm} \;\Rightarrow\; Y > \frac{F}{B} \cdot \frac{\Wici}{\Whbm}.
+\]
+
+If we use a smaller $\text{BS} = 64$:
+\[
+Y > \frac{28672}{64} \cdot \frac{9.0 \cdot 10^{10}}{8.2 \cdot 10^{11}} \approx 49.
+\]
+
+So our ici time will take less than hbm and we can use this TP scheme w/o a hit in latency or throughput (at a smaller $\text{BS} = 64$).
+
+\section*{What about prefill?}
+
+\section*{Q10}
+
+During prefill, we have large BS, so we're comp bound. FLOPs are dominated by linear ops so:
+\[
+\Tstep \approx \frac{2 \cdot 8192 \cdot 70 \cdot 10^9}{0.4 \cdot 16 \cdot 1.97 \cdot 10^{14}} = 0.9 \text{ s.}
+\]
+
+\section*{Q11}
+
+\subsection*{(i)}
+
+A seq finishes when we generate all of its tokens.
+\[
+\Rightarrow \frac{32}{4096} \text{ sequences finish per sec.}
+\]
+
+\subsection*{(ii)}
+
+We evict $\underbrace{8192}_{\text{prompt}} + \underbrace{4096}_{\text{gen}}$ tokens from KV cache after 4096 steps $\Rightarrow \frac{8192 + 4096}{4096}$ tokens evicted/s.
+
+\section*{Q12}
+
+Assuming each prefill server only processes one sequence at a time. Want throughputs of both to be the same.
+
+$P = $ \# prefill servers, $D = $ \# decode servers.
+\[
+\text{Prefill servers throughput} = P \cdot \frac{1}{\text{(prefill latency)}} \text{ seq/s} = \frac{P}{T_p}.
+\]
+\[
+\text{Decode servers throughput} = \frac{D \cdot \text{BS}}{\underbrace{\text{(decode latency)}}_{T_d} \cdot \underbrace{\text{(median decode len)}}_{T}} \text{ seq/s}.
+\]
+\[
+\frac{P}{T_p} = \frac{D \cdot \text{BS}}{T_d \cdot T}
+\]
+\[
+\Rightarrow \frac{P}{D} = \frac{T_p \cdot \text{BS}}{T_d \cdot T} = \frac{0.91 \cdot 44}{19 \cdot 10^{-3} \cdot 512} \approx 4 \quad \text{(using $T_d$ and BS from earlier problems).}
+\]
+
+The problem soln handwaves the 44 BS as 32 with $T_d = 19 \cdot 10^{-3}$. Using this:
+\[
+\frac{P}{D} = \frac{0.91 \cdot 32}{19 \cdot 10^{-3} \cdot 512} = 3.
+\]
+\[
+\Rightarrow \text{We need 3 times as many prefill servers than decode servers to fully saturate both.}
+\]
+
+\section*{Worked Problems}
+
+\section*{1)}
+
+\subsection*{(i)}
+
+\[
+\text{FLOPS/token} \approx 2 \cdot 405 \cdot 10^9 = 810\text{B.}
+\]
+
+\subsection*{(ii)}
+
+\[
+\Tstepmin = \frac{810 \cdot 10^9}{N \cdot 1.97 \cdot 10^{14}} \quad \text{(assuming bf16 FLOPS).}
+\]
+
+\subsection*{(iii)}
+
+Per token, KV cache size is negligible compared to time loading model weights, so assuming weights are stored in bf16:
+\[
+\Tstepmin = \frac{810 \cdot 10^9}{N \cdot 8.2 \cdot 10^{11}}.
+\]
+
+\section*{2)}
+
+Serve Llama 3-8B w/ $\text{BS} = 240$, int8 weights/KV caches, for decode.
+
+\subsection*{(i)}
+
+\paragraph{a)}
+\[
+\text{Mem}_{\text{params}} = 8 \cdot 10^9 = 8 \text{ GB.}
+\]
+
+\paragraph{b)} With max context length $= 8192$:
+\begin{align*}
+\text{KV Cache Size for Batch} &= 2 \cdot H \cdot K \cdot L \cdot T \cdot \text{BS} \\
+&= 2 \cdot 128 \cdot 8 \cdot 32 \cdot 8192 \cdot 240 \\
+&\approx 128 \cdot 10^9 = 128 \text{ GB.}
+\end{align*}
+
+\paragraph{c)} The biggest activation we ever need to hold is through the MLP of size $[B, T, F] \Rightarrow [B, F]$
+\[
+= B \cdot F = 240 \cdot 14336 = 3.44 \text{ MB} \quad \text{(negligible compared to above).}
+\]
+
+\subsection*{(ii)}
+
+\[
+\frac{(128 + 8)}{16} = 8.5 \;\Rightarrow\; 4 \times 4 \text{ cluster.}
+\]
+
+\section*{3)}
+
+\subsection*{(i)}
+
+Serve Llama 3-405B on TPU v5e, assume int8 weights and bf16 FLOPs.
+\[
+\text{Size of model weights} = 405 \cdot 10^9 = 405 \text{ GB.}
+\]
+
+With max context length of 8192:
+\[
+\text{Size of KV Cache} = 2 \cdot H \cdot K \cdot L \cdot T = 2 \cdot 128 \cdot 8 \cdot 126 \cdot 8192 \approx 2.1 \text{ GB} \quad \text{(cache in int8).}
+\]
+
+For an extremely small BS, we would need:
+\[
+N_{\min} = \frac{407.1}{16} = 25 \text{ chips} \;\Rightarrow\; 8 \times 4 \text{ slice.}
+\]
+
+With this slice, we could have a max BS of:
+\[
+\text{BS}_{\max} = \frac{(32 \cdot 16 - 405)}{2.1} = 51.
+\]
+
+Under this $\text{BS}_{\max}$, we will be memory-bound for both attn and the linear ops as $\text{BS}_{\max} < B_{\text{crit}} = 120$.
+
+If we shard and do TP across all of our devices, we will be comp-bounded, so ici is not a bottleneck!
+\[
+\frac{2 \cdot F}{2200} = 48 > Y = 32.
+\]
+
+Changing our BS is a knob that we can tune to decrease latency or increase throughput.
+
+Assuming we have a $\text{BS} = 32$:
+\[
+\Tstepmin = \frac{32 \cdot 2.1 \cdot 10^9 + 405 \cdot 10^9}{32 \cdot 8.2 \cdot 10^{11}} \approx 18 \text{ ms.}
+\]
+\[
+\text{Max tokens/s/chip} = \frac{32}{\Tstepmin \cdot 32} \approx 56.
+\]
+
+For prefill, under this scheme, for a prompt of 8192 tokens under 40\% MFU:
+\[
+\Tstep = \frac{2 \cdot 405 \cdot 10^9 \cdot 8192}{32 \cdot 0.4 \cdot 1.97 \cdot 10^{14}} = 2.63 \text{ s.}
+\]
+
+For serving, I'd also use P/D disaggregation. Since I'd want both prefill/decode servers to be fully saturated (assuming median decode of 512 and prefill of 8192):
+
+$P = $ \# prefill servers, $D = $ \# decode servers.
+\[
+\text{Prefill throughput} = \frac{P}{T_p}, \qquad \text{Decode throughput} = \underbrace{\frac{D \cdot B}{T_D \cdot 512}}_{\text{for finishing a full sequence}}.
+\]
+\[
+\Rightarrow \frac{P}{T_p} = \frac{D \cdot B}{T_D \cdot 512} \;\Rightarrow\; \frac{P}{D} = \frac{T_p \cdot B}{T_D \cdot 512} = \frac{2.63 \cdot 32}{0.018 \cdot 512} \approx 10.
+\]
+
+We need 10 times as many prefill than decode servers.
+
+\subsection*{(ii)}
+
+If we have a strict $\Tstep = 15$ ms, need to find BS that satisfies this.
+\[
+\Tstep = \frac{\text{BS} \cdot \text{KV Cache Size} + \text{Params Size}}{32 \cdot \Whbm}.
+\]
+\[
+\Rightarrow \text{BS} = \frac{32 \cdot \Whbm \cdot \Tstep - \text{Params Size}}{\text{KV Cache Size}}.
+\]
+
+This constraint is not possible with $N = 32$.
+
+On a $8 \times 8$ slice:
+\[
+\text{BS} \leq 182 \quad \text{(fits in HBM)}
+\]
+\[
+\Rightarrow \text{Max tokens/s} = \frac{182}{15 \cdot 10^{-3}} = 12133.
+\]
+
+\subsection*{(iii)}
+
+If we use a $\text{BS} = 1$ under which we will still be mem-bounded, our throughput drops but latency is minimized at:
+\[
+\Tstepmin = \frac{1 \cdot 2.1 \cdot 10^9 + 405 \cdot 10^9}{32 \cdot 8.2 \cdot 10^{11}} \approx 15.5 \text{ ms.}
+\]
+
+\end{document}
