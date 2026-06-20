@@ -1,0 +1,587 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Wici}{W_{\text{ici}}}
+\newcommand{\Whbm}{W_{\text{hbm}}}
+
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{codecomment}{rgb}{0,0.5,0}
+\definecolor{codekeyword}{rgb}{0.6,0,0.6}
+\definecolor{codestring}{rgb}{0.58,0,0.82}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  commentstyle=\color{codecomment},
+  keywordstyle=\color{codekeyword},
+  stringstyle=\color{codestring},
+  language=Python,
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{black!30},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+}
+
+\title{Scaling Book --- Section 9 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Q projection op exercise}
+
+\[
+X[32, 1024, 8192] \cdot W_Q[8192, 32, 256] \quad \text{on v2 } 4 \times 2 \text{ slice.}
+\]
+
+\[
+\text{BS} = \frac{32 \cdot 1024}{4} = 8192 \quad \text{so we're compute bound.}
+\]
+
+\[
+\text{FLOPS} = 2 \cdot 32 \cdot 1024 \cdot 8192 \cdot 32 \cdot 256 \approx 2.46 \cdot 10^{12}.
+\]
+
+\[
+T_{\text{comp}} = \frac{2.46 \cdot 10^{12}}{8 \cdot 23 \cdot 10^{12}} = 13.4 \text{ ms.}
+\]
+
+This is close to the wall duration in the profile!
+
+\section*{Worked Problems}
+
+\section*{Q1) Trace}
+
+\paragraph{multiply\_reduce\_fusion.1:}
+\[
+\underbrace{\text{bf16}[4096, 8192]}_{W_1} \cdot \underbrace{\text{bf16}[8192]}_{\text{In}} \to \underbrace{\text{bf16}[4096]}_{\text{Tmp}} \quad \Rightarrow \text{matmul}
+\]
+
+\paragraph{multiply\_reduce\_fusion:}
+\[
+\underbrace{\text{bf16}[8192, 4096]}_{W_2} \cdot \underbrace{\text{bf16}[4096]}_{\text{Tmp}} \to \underbrace{\text{bf16}[8192]}_{\text{Out}} \quad \Rightarrow \text{matmul (feeding in result from last HLO op)}
+\]
+
+\paragraph{all\_reduce:}
+\[
+\text{all\_reduce}(\text{bf16}[1, 8192]) \to \text{bf16}[1, 8192]
+\]
+
+Running on a v5e-8 slice and replica groups is 8, so sharded across all devices on contracting dim.
+
+\paragraph{Computation:}
+\[
+W_1[I_{xy}, J] \cdot_J \text{In}[J] \to \text{Tmp}[I_{xy}]
+\]
+\[
+W_2[K, I_{xy}] \cdot_I \text{Tmp}[I_{xy}] \to \text{Out}[K]\{U_{xy}\}
+\]
+\[
+\text{AllReduce}_{xy}(\text{Out}[K]\{U_{xy}\}) \to \text{Out}[K]
+\]
+
+\[
+\underbrace{\text{bf16}[32768, 8192]}_{W_1} \cdot \underbrace{\text{bf16}[8192]}_{\text{In}} \cdot \underbrace{\text{bf16}[8192, 32768]}_{W_2} \to \text{bf16}[8192]
+\]
+
+This operation is essentially the up and down projection in an MLP where the $F$ dim is sharded across all 8 devices.
+
+\section*{Q2) Profiling \& Sharding Optimization}
+
+The following is the full Jupyter notebook used to profile and re-shard the forward pass. Each code block corresponds to one cell in the notebook.
+
+\subsection*{Cell 1: Imports, Config, Layer, Weights}
+
+\begin{lstlisting}[language=Python]
+from flax import struct
+from typing import Callable, Tuple
+
+import collections
+
+import jax
+import jax.numpy as jnp
+
+P = jax.sharding.PartitionSpec
+
+ShardingRules = collections.namedtuple('ShardingRules',
+ ['batch', 'sequence', 'd_model', 'query_heads', 'key_heads', 'key_dim', 'd_ff', 'vocab'])
+
+def _logical_to_physical(logical: Tuple[str, ...], rules: ShardingRules):
+    """Converts logical to physical pspec."""
+    return P(*(getattr(rules, l) for l in logical))
+
+def _logical_to_sharding(logical: Tuple[str, ...], mesh: jax.sharding.Mesh, rules: ShardingRules):
+    """Converts logical to sharding."""
+    return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
+
+
+@struct.dataclass
+class Config:
+  d_model: int
+  ffw_multiplier: int
+  num_layers: int
+
+  query_heads: int
+  kv_heads: int
+  key_dim: int
+
+  vocab_size: int
+
+  dtype: jnp.dtype = jnp.bfloat16
+
+
+@struct.dataclass
+class TensorInfo:
+  shape: jax.ShapeDtypeStruct
+  logical_axes: tuple[str, ...]
+  initializer: Callable | None = None
+
+
+@struct.dataclass
+class Layer:
+
+  q: jax.Array | TensorInfo
+  k: jax.Array | TensorInfo
+  v: jax.Array | TensorInfo
+  proj: jax.Array | TensorInfo
+
+  w1: jax.Array | TensorInfo
+  w2: jax.Array | TensorInfo
+
+  gamma1: jax.Array | TensorInfo
+  gamma2: jax.Array | TensorInfo
+
+  @classmethod
+  def abstract(cls, cfg: Config):
+    return Layer(
+        q=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), dtype=cfg.dtype),
+            ('d_model', 'query_heads', 'key_dim'),
+            jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2)),
+        ),
+        k=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model, cfg.kv_heads, cfg.key_dim), dtype=cfg.dtype),
+            ('d_model', 'query_heads', 'key_dim'),
+            jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2)),
+        ),
+        v=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model, cfg.kv_heads, cfg.key_dim), dtype=cfg.dtype),
+            ('d_model', 'query_heads', 'key_dim'),
+            jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2)),
+        ),
+        proj=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), dtype=cfg.dtype),
+            ('query_heads', 'key_dim', 'd_model'),
+            jax.nn.initializers.he_normal(in_axis=(0,1), out_axis=2),
+        ),
+        w1=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), dtype=cfg.dtype),
+            ('d_model', 'd_ff'),
+            jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+        ),
+        w2=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), dtype=cfg.dtype),
+            ('d_ff', 'd_model'),
+            jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+        ),
+        gamma1=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model,), dtype=cfg.dtype),
+            ('d_model',),
+            jax.nn.initializers.constant(1.0),
+        ),
+        gamma2=TensorInfo(
+            jax.ShapeDtypeStruct((cfg.d_model,), dtype=cfg.dtype),
+            ('d_model',),
+            jax.nn.initializers.constant(1.0),
+        ),
+    )
+
+@struct.dataclass
+class Weights:
+  layers: list[Layer]
+  embedding: jax.Array | TensorInfo
+
+  @classmethod
+  def abstract(cls, cfg: Config):
+      return Weights(
+        layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
+        embedding=TensorInfo(
+          jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.dtype),
+          ('vocab', 'd_model'),
+          jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
+        ),
+    )
+
+  @classmethod
+  def sharding(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    abstract = cls.abstract(cfg)
+    return jax.tree.map(lambda info: _logical_to_sharding(info.logical_axes, mesh, rules), abstract,
+                        is_leaf=lambda x: isinstance(x, TensorInfo))
+
+  @classmethod
+  def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    abstract = cls.abstract(cfg)
+
+    def _init():
+      num_leaves = len(jax.tree.leaves(abstract, is_leaf=lambda x: isinstance(x, TensorInfo)))
+      rng_iter = iter(jax.random.split(key, num_leaves))
+      return jax.tree.map(
+          lambda info: info.initializer(next(rng_iter), info.shape.shape, info.shape.dtype), abstract,
+          is_leaf=lambda x: isinstance(x, TensorInfo))
+
+    sharding = cls.sharding(cfg, mesh, rules)
+    return jax.jit(_init, out_shardings=sharding)()
+\end{lstlisting}
+
+\subsection*{Cell 2: rms\_norm, layer\_forward, forward}
+
+\begin{lstlisting}[language=Python]
+def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
+    """Apply RMS normalization."""
+    """
+    ORIGINAL:
+    Negligible flops but for sharding scheme:
+    x[B, T, D@X] => x[B, T] by fused vector ops in the last matmul and then an AR across the partial sums for the mean
+    outputs similar sharding x[B, T, D@X]
+
+    INSTEAD:
+    Still need to AR but now that B is sharded as well, this comm should be faster.
+    """
+    rms = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + 1e-6)
+    return gamma * x * rms
+
+def layer_forward(x: jax.Array, layer: Layer) -> jax.Array:
+  x = jax.lax.with_sharding_constraint(x, jax.P('x', None, 'y'))
+
+  with jax.named_scope('pre_attn_norm'):
+    attn_in = rms_norm(x, layer.gamma1)
+
+  # Q, K, V projections
+  with jax.named_scope('qkv_matmul'):
+    """
+    ORIGINAL:
+    roofline = 3*2*btdhn / (8 * 1.97e14) = 1ms
+    actual = 8.174ms
+    Note: (N == Q == K == V)
+
+    op: x[B, T, D@X] @ W_q[D@X, N@Y, H] => q,k,v[N@Y, H, B, T]
+    steps:
+    x[B, T, D@X] @ W_q[D@X, N@Y, H] => q,k,v[N@Y, H, B, T]{U_X}
+    AR_X(q,k,v[N@Y, H, B, T]{U_X}) = q,k,v[N@Y, H, B, T]
+    (AR dominates the time here)
+
+    INSTEAD:
+    If x[B@X, T, D@Y] (like in the mixed FSDP+TP section):
+    x[B@X, T, D@Y] @ W_q[D@X, N@Y, H] => x[B@X, T, N@Y, H]
+    (still need to do 2 AG which is still slightly less than AR since
+     one AG is over Y while the AR is over X. Additionally, one AG
+     can be done ahead of time if optimized by the compiled.)
+    """
+    q = jnp.einsum('btd,dhq->bhtq', attn_in, layer.q)
+    k = jnp.einsum('btd,dhk->bhtk', attn_in, layer.k)
+    v = jnp.einsum('btd,dhv->bhtv', attn_in, layer.v)
+
+  # TODO: add RoPE here
+
+  # just to ensure
+  x = jax.lax.with_sharding_constraint(x, jax.P('x', None, 'y'))
+
+  # Attention
+  with jax.named_scope('attn'):
+    """
+    ORIGINAL:
+    roofline = (2bhtsn + 2bhstn) / (8 * 1.97e14) = 0.08ms
+    actual = 1ms
+
+    (already very small, not dominant flops)
+    """
+    scale = q.shape[-1] ** -0.5
+    # TODO: add masking here
+
+    num_query_heads, num_kv_heads = q.shape[1], k.shape[1]
+
+    if num_query_heads == num_kv_heads or num_kv_heads == 1:
+      qk = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
+      logits = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
+      attn_vec = jnp.einsum('bhsd,bhts->bhtd', v, logits)
+    else:
+      assert num_query_heads % num_kv_heads == 0
+      q = q.reshape(q.shape[0:1] +
+                    (num_kv_heads, num_query_heads // num_kv_heads) +
+                    q.shape[2:])
+      qk = jnp.einsum('bqhtd,bhsd->bqhts', q, k) * scale
+      logits = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
+      attn_vec = jnp.einsum('bqsd,bqhts->bqhtd', v, logits)
+      attn_vec = attn_vec.reshape(attn_vec.shape[0:1] + (num_query_heads,) + attn_vec.shape[3:])
+
+  # Attention proj
+  """
+  ORIGINAL:
+  roofline = 2bhtnd / (8 * 1.97e14) = 0.3ms
+  actual = 1.98ms
+  (dominated by AR)
+  op: attn_vec[B, H, T, N@Y] @ [H, N@Y, D@X] => [B, T, D@X]
+  steps:
+  attn_vec[B, H, T, N@Y] @ [H, N@Y, D@X] => [B, T, D@X]{U_Y}
+  AR_Y([B, T, D@X]{U_Y}) => [B, T, D@X]
+
+  INSTEAD:
+  op: attn_vec[B@X, H, T, N@Y] @ [H, N@Y, D@X] => [B@X, T, D@Y]
+  steps:
+  AG_X([H, N@Y, D@X]) => [H, N@Y, D]
+  attn_vec[B@X, H, T, N@Y] @ [H, N@Y, D] => [B@X, T, D]{U_Y}
+  RS_Y,D([B@X, T, D]{U_Y}) => [B@X, T, D@Y]
+
+  Timing doesn't change that much under sharding.
+  """
+  with jax.named_scope('attn_proj'):
+    attn_out = jnp.einsum('bhtv,hvd->btd', attn_vec, layer.proj)
+
+  # Residual connection
+  with jax.named_scope('residual'):
+    x = x + attn_out
+
+  # Second RMSNorm (Pre-LN for FFN)
+  with jax.named_scope('ffn_pre_norm'):
+    ffw_in = rms_norm(x, layer.gamma2)
+
+  jax.lax.with_sharding_constraint(ffw_in, jax.P('x', None, 'y'))
+
+  """
+  ORIGINAL:
+  roofline = 2*2btdf / (8 * 1.97e14) = 5ms
+  actual = 24.9ms (much larger!)
+
+  op1: [B, T, D@X] @ [D@X, F@Y] = [B, T, F@Y]
+  steps:
+  [B, T, D@X] @ [D@X, F@Y] = [B, T, F@Y]{U_X}
+  AR_X([B, T, F@Y]{U_X}) = [B, T, F@Y]
+
+  op2: [B, T, F@Y] @ [F@Y, D@X] => [B, T, D@X]
+  steps:
+  [B, T, F@Y] @ [F@Y, D@X] => [B, T, D@X]{U_Y}
+  AR_Y([B, T, D@X]{U_Y}) = [B, T, D@X]
+
+  INSTEAD:
+  op1: [B@X, T, D@Y] @ [D@X, F@Y] => [B@X, T, F@Y]
+  steps:
+  AG_Y([B@X, T, D@Y]) = [B@X, T, D]
+  AG_X([D@X, F@Y]) = [D, F@Y]
+  [B@X, T, D] @ [D, F@Y] = [B@X, T, F@Y]
+
+  op2: [B@X, T, F@Y] @ [F@Y, D@X] => [B@X, T, D@Y]
+  steps:
+  AG_X([F@Y, D@X]) = [F@Y, D]
+  [B@X, T, F@Y] @ [F@Y, D] => [B@X, T, D]{U_Y}
+  RS_Y,D([B@X, T, D]{U_Y}) = [B@X, T, D@Y]
+
+  (under the new scheme, we would have cheaper comms)
+  """
+  with jax.named_scope('ffw'):
+    ffw_out = jnp.einsum('btd,df->btf', ffw_in, layer.w1).astype(jnp.bfloat16)
+    ffw_out = jax.nn.gelu(ffw_out)
+    ffw_out = jnp.einsum('btf,fd->btd', ffw_out, layer.w2).astype(jnp.bfloat16)
+
+  # Residual connection
+  with jax.named_scope('residual'):
+    x = x + ffw_out
+
+  # just to ensure
+  x = jax.lax.with_sharding_constraint(x, jax.P('x', None, 'y'))
+
+  return x
+
+
+def forward(x: jax.Array, weights: Weights) -> jax.Array:
+  """Forward pass through the network."""
+
+
+  # Initially, x = [B@X, T]
+  one_hot = jax.nn.one_hot(x, cfg.vocab_size)
+  """
+  ORIGINAL
+  x = [B@X, T, V]
+  bottom matmul should take (2btvd) / (8 * 1.97e14) = 2.7ms
+  actual time = 11.4ms!
+
+  op: x[B@X, T, V] @ [V, D@X] => [B, T, D@X]
+  steps:
+  AG_X(x[B@X, T, V]) => x[B, T, V]
+  x[B, T, V] @ [V, D@X] => [B, T, D@X]
+
+
+  INSTEAD
+  op: x[B@X, T, V] @ [V, D@X] => [B@X, T, D@Y]
+  steps:
+  Reshard([V, D@X]) => [V, D@Y]
+  x[B@X, T, V] @ [V, D@Y] => [B@X, T, D@Y]
+  """
+  x = jnp.einsum('vd,btv->btd', weights.embedding, one_hot)
+
+  for idx, layer in enumerate(weights.layers):
+    with jax.named_scope(f'layer_{idx}'):
+      x = layer_forward(x, layer)
+
+  logits = jnp.einsum('vd,btd->btv', weights.embedding, x)
+  return jax.nn.log_softmax(logits, axis=-1)
+\end{lstlisting}
+
+\subsection*{Cell 3: Sharding rules}
+
+\begin{lstlisting}[language=Python]
+fsdp_rules = ShardingRules(
+    batch=('x', 'y'),
+    sequence=None,
+    d_model=('x', 'y'),
+    query_heads=None,
+    key_heads=None,
+    key_dim=None,
+    d_ff=None,
+    vocab=None
+)
+
+model_parallel_rules = ShardingRules(
+    batch=None,
+    sequence=None,
+    d_model=None,
+    query_heads=('x', 'y'),
+    key_heads=('x', 'y'),
+    key_dim=None,
+    d_ff=('x', 'y'),
+    vocab=None
+)
+
+mixed_rules = ShardingRules(
+    batch='x',
+    sequence=None,
+    d_model='x',
+    query_heads='y',
+    key_heads='y',
+    key_dim=None,
+    d_ff='y',
+    vocab=None
+)
+\end{lstlisting}
+
+\subsection*{Cell 4: Clear live arrays}
+
+\begin{lstlisting}[language=Python]
+for arr in jax.live_arrays():
+  arr.delete()
+\end{lstlisting}
+
+\subsection*{Cell 5: Config, mesh, init weights}
+
+\begin{lstlisting}[language=Python]
+Auto = jax.sharding.AxisType.Auto
+
+cfg = Config(
+    d_model=8192,
+    ffw_multiplier=4,
+    num_layers=4,
+    query_heads=16,
+    kv_heads=16,
+    key_dim=256,
+    vocab_size=32_128,
+    dtype=jnp.bfloat16,
+)
+
+mesh = jax.make_mesh((4, 2), ('x', 'y'), (Auto, Auto))
+jax.set_mesh(mesh)
+print(mesh)
+
+rules = mixed_rules
+
+rng = jax.random.PRNGKey(42)
+weights = Weights.init(cfg, rng, mesh, rules)
+\end{lstlisting}
+
+\subsection*{Cell 6: Compile}
+
+\begin{lstlisting}[language=Python]
+batch_size = 8
+seq_len = 1024
+
+input_sharding = _logical_to_sharding(('batch', 'sequence'), mesh=mesh, rules=rules)
+x = jnp.zeros((batch_size, seq_len), dtype=jnp.int32, device=input_sharding)
+
+compiled = jax.jit(forward).lower(x, weights).compile()
+\end{lstlisting}
+
+\subsection*{Cell 7: Profile}
+
+\begin{lstlisting}[language=Python]
+with jax.profiler.trace("/kaggle/working/tensorboard"):
+  logits = compiled(x, weights)
+  jax.block_until_ready(logits)
+\end{lstlisting}
+
+\subsection*{Cell 8: Zip the tensorboard trace}
+
+\begin{lstlisting}[language=Python]
+import os
+import shutil
+from IPython.display import FileLink, display
+
+# Folder where JAX wrote the TensorBoard trace
+src_dir = "/kaggle/working/tensorboard"
+
+# Zip output path
+zip_base = "/kaggle/working/tensorboard"
+zip_file = zip_base + ".zip"
+
+# Check trace folder exists
+if not os.path.exists(src_dir):
+    raise FileNotFoundError(f"{src_dir} does not exist. Make sure your profiler wrote here.")
+
+# Remove old zip if present
+if os.path.exists(zip_file):
+    os.remove(zip_file)
+
+# Create zip
+shutil.make_archive(
+    base_name=zip_base,
+    format="zip",
+    root_dir=src_dir,
+)
+
+# Verify it exists
+print("Created:", zip_file)
+!ls -lh /kaggle/working/tensorboard.zip
+
+# Make Kaggle download link
+os.chdir("/kaggle/working")
+display(FileLink("tensorboard.zip"))
+\end{lstlisting}
+
+\subsection*{Additional Questions}
+
+Under this fix, the highest MXU I now get is 12.7\% compared to 13.3\%. However, the total forward pass time has halved from 206 ms to 109 ms. I suspect the slight decrease in MXU might be from more comms launched even though each comm is much cheaper.
+
+\begin{enumerate}[leftmargin=*]
+  \item The sharding strategy I changed it to is a mixed FSDP + TP. Specifically, this is 4-way FSDP and 2-way TP.
+  \item $\text{BS} = 8$ but per device it's $\text{BS}_{\text{local}} = 2$. $d_{\text{model}} = 8192$ but per device (on activations) becomes 2048. $d_{\text{ff}} = 4 \cdot d_{\text{model}} = 32768$ but per device is 16384.
+  \item Including the projections in attention, under my optimized scheme, the attention block takes around 7 ms while the MLP block takes around 11 ms.
+  \item Rooflines are written above their corresponding code blocks above (BS and sequence length are large enough that on roofline we should be compute bound).
+\end{enumerate}
+
+\end{document}
