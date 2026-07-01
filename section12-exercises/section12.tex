@@ -1,0 +1,538 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, mathtools}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\newcommand{\flops}{\text{FLOPs}}
+\newcommand{\flopss}{\text{FLOPs/s}}
+\newcommand{\Tmath}{T_{\text{math}}}
+\newcommand{\Tcomm}{T_{\text{comm}}}
+\newcommand{\Tcomp}{T_{\text{comp}}}
+\newcommand{\Tstep}{T_{\text{step}}}
+\newcommand{\Tstepmin}{T_{\text{step,min}}}
+\newcommand{\Wici}{W_{\text{ICI}}}
+\newcommand{\Whbm}{W_{\text{HBM}}}
+\newcommand{\Wcoll}{W_{\text{collective}}}
+
+\title{Scaling Book --- Section 12 Exercises}
+\author{Rahul Bir}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Quiz 1 (GPU hardware)}
+
+\subsection*{Q1}
+
+H100:
+\begin{align*}
+\text{\# fp32 cuda cores} &= \underbrace{132}_{\text{SMs}} \cdot \underbrace{4}_{\substack{\text{sub-}\\ \text{partitions}}} \cdot \underbrace{32}_{\text{width}} = 16{,}896
+\end{align*}
+
+B200:
+\begin{align*}
+\text{\# fp32 cuda cores} &= 148 \cdot 4 \cdot 32 = 18{,}944
+\end{align*}
+
+TPU v5p:
+\begin{align*}
+\text{\# ALUs} &= \underbrace{2}_{\text{2 cores}} \cdot \underbrace{4}_{\text{layers}} \cdot \underbrace{8 \cdot 128}_{\text{lanes/sublanes}} = 8192
+\end{align*}
+
+\subsection*{Q2}
+
+H100 details:
+\begin{itemize}[leftmargin=1.5em]
+    \item 132 SMs
+    \item 1.59 GHz (1.98 GHz boost) clock speed
+    \item 1 vector op / cycle / ALU
+\end{itemize}
+
+\[
+\text{fp32 FLOPs/s no boost} = 1 \;\text{(op/cycle/ALU)} \cdot 16896 \;\text{(ALU)} \cdot 1.59 \cdot 10^9 \;\text{cycles/s} \approx 27 \;\text{TFLOPs/s}
+\]
+
+\[
+\text{fp32 FLOPs/s w/ boost} = 1 \cdot 16896 \cdot 1.98 \cdot 10^9 = 33.5 \;\text{TFLOPs/s}
+\]
+
+\subsection*{Q3}
+
+\begin{enumerate}[label=(\roman*)]
+    \item \[
+    \text{Intensity}_{\text{fp16}}(\text{H100}) = \frac{9.9 \cdot 10^{14}}{3.4 \cdot 10^{12}} = 283 \;\text{FLOPs/byte}
+    \]
+
+    \item \[
+    \text{Intensity}_{\text{fp16}}(\text{B200}) = \frac{2.3 \cdot 10^{15}}{8.0 \cdot 10^{12}} = 288 \;\text{FLOPs/byte}
+    \]
+
+    \item \[
+    \text{Intensity}_{\text{fp8}}(\text{H100}) = \frac{2 \cdot 10^{15}}{3.4 \cdot 10^{12}} = 588 \;\text{FLOPs/byte}
+    \]
+    \[
+    \text{Intensity}_{\text{fp8}}(\text{B200}) = \frac{4.5 \cdot 10^{15}}{8 \cdot 10^{12}} = 563 \;\text{FLOPs/byte}
+    \]
+\end{enumerate}
+
+\subsection*{Q4}
+
+\[
+\text{Intensity}_{\text{bf16}}(\text{matmul}) = \frac{2BDF}{2BD + 2DF + 2BF} \approx B
+\]
+
+\begin{enumerate}[label=(\roman*)]
+    \item $\text{fp16}[64, 4096] \cdot \text{fp16}[4096, 8192]$
+
+    $64 < 288 \Rightarrow$ bw bound
+    \[
+    \Tmath = \frac{2BD + 2DF + 2BF}{\text{B200 mem bytes/s}} = 8.6 \;\mu s
+    \]
+
+    \item $\text{fp16}[512, 4096] \cdot \text{fp16}[4096, 8192]$
+
+    $512 > 288 \Rightarrow$ compute bound
+    \[
+    \Tmath = \frac{2BDF}{\text{B200 fp16 FLOPs/s}} = 14.9 \;\mu s
+    \]
+\end{enumerate}
+
+\subsection*{Q5}
+
+H100:
+\begin{align*}
+\text{L1/SMEM capacity} &= 132 \cdot 256 \cdot 10^3 \;\text{bytes} = 33.8 \;\text{MB} \\
+\text{Registers} &= 132 \cdot 4 \cdot 16384 \cdot 4 = 34.6 \;\text{MB} \\
+\text{TPU VMEM} &= 128 \;\text{MB}
+\end{align*}
+
+\subsection*{Q6}
+
+B200 can do 80 TFLOPs/s of fp32 compute. Each cuda core can do 2 FLOPs/cycle in FMA.
+
+\[
+\frac{80 \cdot 10^{12} \;\frac{\text{FLOPs}}{\text{s}}}{148 \cdot 4 \cdot 32 \cdot 2 \;\text{FLOPs/cycle}} \approx 2.1 \;\text{GHz}
+\]
+
+\subsection*{Q7}
+
+\begin{enumerate}[label=(\roman*)]
+    \item \begin{align*}
+    \text{FLOPs} &= N - 1 \\
+    \text{bytes} &= 3N \cdot 4 = 12N \\
+    \Tcomp &= \frac{N-1}{C} \qquad T_{\text{mem}} = \frac{12N}{W} \\
+    \text{AI} &= \frac{N-1}{12N} \approx \frac{N}{12N} = \frac{1}{12}
+    \end{align*}
+
+    We will be very comms bound.
+
+    \item H100:
+
+    $N = 1024$
+    \[
+    T = \frac{12 \cdot 1024}{3.4 \cdot 10^{12}} = 3.36 \;\text{ns}
+    \]
+
+    $N = 1024^3$
+    \[
+    T = \frac{12 \cdot 1024^3}{3.4 \cdot 10^{12}} \approx 3.8 \;\text{ms}
+    \]
+
+    No H100 access, on a A100 SXM4 40GB:
+
+    $N = 1024$
+    \[
+    T = \frac{12 \cdot 1024}{1.5 \cdot 10^{12}} = 8 \;\text{ns}
+    \]
+
+    $N = 1024^3$
+    \[
+    T = \frac{12 \cdot 1024^3}{1.5 \cdot 10^{12}} \approx 8.5 \;\text{ms}
+    \]
+
+    On a real A100:
+
+    $N = 1024$
+
+    $T = 2.4 \;\mu s \Rightarrow$ we are very latency bound here
+
+    $N = 1024^3$
+
+    $T = 9 \;\text{ms} \Rightarrow$ very close to roofline!
+\end{enumerate}
+
+\section*{Quiz 2}
+
+\subsection*{Q1}
+
+$8 \times$H100 node w/ 4 NVSwitch switches.
+
+Each switch has 64 NVLink ports:
+\[
+W_{\text{BW,max}} = 64 \cdot 4.25 \cdot 10^9 \;\text{bytes/s} = 6.4 \;\text{TB/s full-duplex}
+\]
+
+However, each H100 only has 18 NVLink connections:
+\[
+W_{\text{BW,node}} = 8 \cdot 18 \cdot 25 \cdot 10^9 \;\text{bytes/s} = 3.6 \;\text{TB/s full-duplex}
+\]
+
+\subsection*{Q2}
+
+Every switch connects to every H100, so with any even bisection of the nodes, all of the H100s in one group can use their NVLinks to send data to the other group.
+
+\[
+W_{\text{bisect}} = \underbrace{2}_{\text{bidir}} \cdot \underbrace{4 \cdot 18 \cdot 25 \cdot 10^9}_{\substack{\text{data one group}\\\text{can send to other}}} = 3.6 \;\text{TB/s}
+\]
+
+\subsection*{Q3}
+
+$\text{bf16}[D_x, F]$ on $8 \times$H100 node, $D = 4096$, $F = 65536$. Throughput-bounded.
+
+Each H100 uses its full egress bw to send its shard to another H100 one at a time:
+\[
+T_{\text{AG}} = \frac{2 \cdot \left(\frac{D}{X} \cdot F\right)}{18 \cdot 25 \cdot 10^9} \cdot (8 - 1) = 1.04 \;\text{ms}
+\]
+
+\section*{Quiz 3}
+
+\subsection*{Q1}
+
+At the leaf level:
+\[
+W_{\text{egress,total}} = 8 \cdot 32 \cdot 50 \;\text{GB/s} = 12.8 \;\text{TB/s}
+\]
+$\Rightarrow$ 400 GB/s/node fat-tree bw full-duplex
+
+At the spine level:
+\[
+W_{\text{egress,total}} = 16 \cdot 4 \cdot 8 \cdot 2 \cdot 50 \;\text{GB/s} = 51.2 \;\text{TB/s}
+\]
+$\Rightarrow$ 400 GB/s/node fat-tree bw full-duplex
+
+At all levels in the tree, we can support 400 GB/s of egress b/w nodes in an equal bisection in parallel.
+
+\subsection*{Q2}
+
+\begin{enumerate}[label=(\roman*)]
+    \item 2048 GPUs $\Rightarrow$ need to double total unit bw at the spine level.
+
+    Scheme: Double spine switches and scalable units
+    \[
+    \Rightarrow \frac{32 \cdot 8 \cdot 8 \cdot 2 \cdot 50}{8 \cdot 32} = 800 \;\text{GB/s/node} \Rightarrow \text{cut to single link from leaf to spine}
+    \]
+    \[
+    \Rightarrow 400 \;\text{GB/s/node}
+    \]
+    Each spine switch has $8 \cdot 8 = 64$ IB cables which uses up all of its ports.
+
+    \item 4096 GPUs
+
+    We use up all the spine switch ports in the 2048 and 1024 config. So need to double spine switches like under the 2048 scheme but keep only 4 SU under each 32 spine switches and instead combine 4 of these superpods.
+
+    Scheme:
+
+    Each 1024 GPU superpod has 32 spine switches but only a single $1 \times 400$ Gbps IB cable connects a leaf switch to a spine switch.
+    \[
+    \Rightarrow \frac{32 \cdot 8 \cdot 4 \cdot 50 \;\text{GB/s}}{32 \cdot 4} = 400 \;\text{GB/s/node}
+    \]
+    (our fat-tree bw at the spine level doesn't get affected).
+
+    Add one more layer of switches connecting the 4 superpods that NVIDIA refers to as core switches.
+
+    This layer has 64 IB switches. There are $32 \cdot 4 = 128$ spine switches so we can't connect all to all but since every spine switch from a superpod connects all to all w/ every leaf switch under it, each core switch can take 16 cables from a certain index of spine switch on every superpod and reach every other node.
+
+    We need fat-tree bw to be 400 GB/s at our top layer as well:
+    \[
+    \frac{64 \cdot 16 \cdot 4 \cdot 50}{32 \cdot 16} = 400 \;\text{GB/s/node} \checkmark
+    \]
+\end{enumerate}
+
+\section*{Pop Quiz 1}
+
+$8 \times$H100 node, 450 GB/s full-duplex bw.
+
+AllGather$(\text{bf16}[B_x, F])$, \quad $B = 1024$, \quad $F = 16384$
+\[
+\Tcomm = \frac{\left(\frac{BF}{8}\right) \cdot 2 \cdot (8 - 1)}{450 \;\text{GB/s}} = 65.24 \;\mu s
+\]
+
+\section*{Pop Quiz 2}
+
+$8 \times$H100 node, 450 GB/s unidir bw.
+
+AllToAll$_{X \to N}(\text{bf16}[B_X, N])$, \quad $B = 1024$, $N = 8$, $X = 8$
+
+\begin{enumerate}[label=(\roman*)]
+    \item \begin{align*}
+    \Tcomm &= \frac{\left(\frac{2 \cdot BN}{X}\right) \cdot (X-1)}{\frac{X}{W}} = \frac{\frac{2BN(X-1)}{X^2}}{W} \approx \frac{2BN}{XW} \\
+    &= \frac{2 \cdot 1024 \cdot 8}{8 \cdot 450 \cdot 10^9} = 4.5 \;\text{ns}
+    \end{align*}
+
+    \item $\Tcomm = \frac{1}{2} \cdot 4.5 = 2.25 \;\text{ns}$
+\end{enumerate}
+
+\section*{Pop Quiz 3}
+
+AllGather$_X(\text{bf16}[D_X, F_Y])$
+
+$Y$ is inner axis over a single SU.
+
+\textbf{Case 1} ($Y \leq 8$):
+\begin{align*}
+\Tcomm^{\text{node}} &= \underbrace{\left(\frac{2DF}{XY}\right)}_{\substack{\text{each}\\ \text{shard}}} \cdot \underbrace{Y}_{\substack{Y \text{ of these}\\ \text{shards moving}\\ \text{in parallel}}} \cdot \underbrace{\left(\frac{D_{\text{node}}}{Y} - 1\right)}_{\text{steps}} \cdot \frac{1}{Y \cdot W_{\text{gpu egress}}} \\
+&= \frac{2DF \cdot (D_{\text{node}} - Y)}{XY^2 \cdot W_{\text{gpu egress}}}
+\end{align*}
+
+Let $M = \#$ of nodes in SU $= 32$.
+\begin{align*}
+\Tcomm^{\text{network}} &= \underbrace{\left(\frac{2DF}{MX}\right)}_{\substack{\text{each shard}\\ \text{size}}} \cdot \underbrace{Y}_{\substack{\text{sending}\\ Y \text{ shards}}} \cdot \underbrace{(M-1)}_{\text{hops}} \cdot \frac{1}{W_{\text{node egress}}} \\
+&= \frac{2DF \cdot (M-1)}{M \cdot W_{\text{node egress}}} = \frac{2DF \cdot 31}{32 \cdot 400 \cdot 10^9}
+\end{align*}
+
+\textbf{Case 2} ($Y > 8$):
+
+$\Tcomm^{\text{node}} = 0$ (no intra-node AG needs to be done)
+\begin{align*}
+\Tcomm^{\text{network}} &= \frac{2DF}{YX} \cdot \underbrace{(X-1)}_{\substack{\# \text{ of}\\ \text{shard per hops}\\ \text{gpu}}} \cdot \frac{1}{W_{\text{node egress per gpu}}} \\
+&= \frac{2DF(X-1)}{YX} \cdot \frac{1}{50 \cdot 10^9}
+\end{align*}
+
+\section*{Quiz 4}
+
+\subsection*{Q1}
+
+Single SU w/ $M$ nodes and $N$ GPUs/node.
+
+\begin{enumerate}[label=(\roman*)]
+    \item Node level switch:
+
+    Within the node, each GPU sends its shard to the node switch which then sends it to every other GPU.
+    \[
+    \text{Ingress}_{\text{node}} = N \cdot \frac{B}{MN} = \frac{B}{M}
+    \]
+
+    From the other nodes, each node switch receives:
+    \[
+    \text{Ingress}_{\text{network}} = \underbrace{\frac{B}{M}}_{\substack{\text{data in}\\ \text{each node}}} \cdot (M-1)
+    \]
+    \[
+    \Rightarrow \text{Ingress/node} = \frac{B}{M} + \frac{B}{M} \cdot (M-1) = B
+    \]
+
+    Within its own node, every network switch egresses each shard from its node's GPUs to every other shard in its node:
+    \[
+    \text{Egress}_{\text{node}} = \frac{B}{NM} \cdot N \cdot (N-1) = \frac{B}{M} \cdot (N-1)
+    \]
+
+    Then from the other nodes, the network switch egresses all the other nodes' data to each of its node's GPUs:
+    \[
+    \text{Egress}_{\text{network,in}} = \frac{B}{M} \cdot (M-1) \cdot N
+    \]
+
+    The node switch also egresses its node level reduction up to the leaf switches:
+    \[
+    \text{Egress}_{\text{network,up}} = \frac{B}{M}
+    \]
+    \begin{align*}
+    \Rightarrow \text{Egress/node} &= \frac{B}{M} \cdot (N-1) + \frac{B}{M} \cdot (M-1) \cdot N + \frac{B}{M} \\
+    &= \frac{B}{M}\left(N - 1 + MN - N + 1\right) \\
+    &= \frac{BMN}{M} = BN
+    \end{align*}
+
+    \item Switch at the top-level:
+
+    The switch ingresses the $\frac{B}{M}$ shards from each node:
+    \[
+    \text{Ingress} = \frac{B}{M} \cdot M = B
+    \]
+
+    The switch egresses to each node the shards from every other node:
+    \[
+    \text{Egress} = \frac{B}{M} \cdot (M-1) \cdot M = B(M-1)
+    \]
+\end{enumerate}
+
+\subsection*{Q2}
+
+Single node with $N$ GPUs/node.
+
+Each GPU first sends $(N-1)$ shards to the switch:
+\[
+\text{Ingress}_1 = \frac{B}{N} \cdot (N-1) \cdot N = B(N-1)
+\]
+
+The switch then egresses the partial sum of its shard to each GPU:
+\[
+\text{Egress}_1 = \frac{B}{N} \cdot N = B
+\]
+
+Each GPU finishes the reduction and sends its shard back to the switch:
+\[
+\text{Ingress}_2 = \frac{B}{N} \cdot N = B
+\]
+
+The switch then egresses each GPUs reduced shard to every other GPU:
+\[
+\text{Egress}_2 = \frac{B}{N} \cdot (N-1) \cdot N = B(N-1)
+\]
+\begin{align*}
+\Rightarrow \text{Ingress} &= B(N-1) + B = BN \\
+\text{Egress} &= B + B(N-1) = BN
+\end{align*}
+
+\subsection*{Q3}
+
+$\text{bf16}[D, F_Y]$ sharded over a single node of $N$ GPUs.
+
+AllReduce$(\text{bf16}[D, F_Y]\{U_X\})$
+
+\begin{enumerate}[label=(\roman*)]
+    \item With SHARP:
+
+    Using answer to last q:
+    \[
+    T_{\text{AR}} = \frac{\left(\frac{2DF}{Y}\right) \cdot N}{N \cdot W_{\text{gpu egress, full-duplex}}} = \frac{2DF}{Y \cdot W_{\text{gpu egress}}}
+    \]
+    (Our bw is full-duplex so ingress/egress can happen simultaneously)
+
+    \item Assuming the array is still sharded on each node only ($Y \leq N$):
+
+    If $Y < N$, then we need to first do a node level reduction:
+    \[
+    \Tcomm^{\text{node}} = \frac{\left(\frac{2DF}{Y}\right) \cdot N}{N \cdot W_{\text{gpu egress}}} = \frac{2DF}{Y \cdot W_{\text{gpu egress}}}
+    \]
+    (our node level reduction time still stays the same)
+
+    At the network level, each node sends all $Y$ shards and since we have SHARP here as well:
+
+    Let $M = \#$ of nodes.
+    \[
+    \Tcomm^{\text{network}} = \frac{2DF}{W_{\text{node egress}}}
+    \]
+\end{enumerate}
+
+\subsection*{Q4}
+
+With $Y = 256$, looking at a H100 superpod.
+
+Each SU does a reduction and sends $2DF$ bytes to the spine switches to be reduced. With in-network connections:
+\[
+\Tcomm = \frac{2DF}{\left(\frac{51.2 \;\text{TB/s}}{4}\right)} \Rightarrow \frac{2DF}{\underbrace{12.8 \cdot 10^{12}}_{\substack{\text{switch bw each}\\ \text{SU has}}}}
+\]
+
+\subsection*{Q5}
+
+$N$ GPUs per node.
+\[
+\Tcomm^{\text{node}} = \left(\frac{B}{N}\right) \cdot \frac{(N-1)}{W_{\text{gpu egress}}}
+\]
+\[
+\Tcomm^{\text{network}} = \left(\frac{B}{2}\right) \cdot \frac{(2-1)}{W_{\text{node egress}}}
+\]
+
+On a H100 superpod, using only 2 nodes:
+\[
+\Tcomm^{\text{node}} = B \cdot \frac{7}{8} \cdot \frac{1}{450 \cdot 10^9} \approx \frac{B}{514 \cdot 10^9}
+\]
+\[
+\Tcomm^{\text{network}} = \frac{B}{2 \cdot 400 \cdot 10^9} = \frac{B}{800 \cdot 10^9}
+\]
+Our intra-node reduction is the bottleneck!
+
+\section*{Quiz 5}
+
+\subsection*{Q1}
+
+B200 DGX Superpod has:
+\begin{itemize}[leftmargin=1.5em]
+    \item 900 GB/s egress within a node
+    \item 400 GB/s in scale-out network
+\end{itemize}
+
+For DP:
+
+At the node level:
+\[
+\frac{B}{X} > \frac{C}{\Wcoll} \Rightarrow \frac{B}{X} > \frac{2250 \cdot 10^{12}}{900 \cdot 10^9} = 2500
+\]
+
+At the network level:
+\[
+\frac{B}{X} > \frac{2250 \cdot 10^{12}}{400 \cdot 10^9} = 5625
+\]
+
+\subsection*{Q2}
+
+Llama-3 70B training in bf16 w/ fp32 Adam optimizer state.
+
+\begin{enumerate}[label=(\roman*)]
+    \item \[
+    2 \cdot 70 \cdot 10^9 + 4 \cdot 2 \cdot 70 \cdot 10^9 = 10 \cdot 70 \cdot 10^9 = 700 \;\text{GB}
+    \]
+    We would need at least 9 80GB H100s or 2 $8 \times$H100 nodes.
+
+    \item \[
+    \text{FLOPS}_{\text{Total}} = 6 \cdot 70 \cdot 10^9 \cdot 15 \cdot 10^{12} = 6.3 \cdot 10^{24}
+    \]
+    \[
+    T = \frac{6.3 \cdot 10^{24}}{4096 \cdot 0.45 \cdot 990 \cdot 10^{12}} \approx 3.45 \cdot 10^6 \;\text{s}
+    \]
+
+    \item $F = 28672$, $BS = 4 \cdot 10^6$
+
+    \begin{enumerate}[label=(\arabic*)]
+        \item Within a node:
+        \[
+        Y < \frac{F \cdot \Wcoll}{C} = \frac{F \cdot 450 \cdot 10^9}{990 \cdot 10^{12}} \approx 14
+        \]
+        Out of node:
+        \[
+        Y < \frac{F \cdot 400 \cdot 10^9}{990 \cdot 10^{12}} \approx 11
+        \]
+        Can't choose 2 nodes since $< 11$
+        $\Rightarrow$ we could do 8-way model parallelism
+
+        \item If we use all 4096 chips, this means $\frac{4096}{8} = 512$-way DP.
+
+        With a 4M BS, this means
+        \[
+        \Tmath = \frac{2 \cdot 2 \cdot 2 \cdot B \cdot D \cdot \left(\frac{F}{8}\right)}{512 \cdot C}
+        \]
+        \[
+        \Tcomm = \frac{2 \cdot 2 \cdot 2 \cdot D \cdot \left(\frac{F}{8}\right)}{\Wcoll}
+        \]
+        \[
+        \Rightarrow \frac{B}{X} > \underbrace{\frac{C}{\Wcoll}}_{\substack{\text{network}\\ \text{level}}} = 2475
+        \]
+        \[
+        \frac{B}{X} = \frac{4 \cdot 10^6}{512} = 7812 > 2475
+        \]
+        We should still be compute-bound under this scheme.
+
+        \item W/ 8-way pipelining, we get an even bigger BS (smaller pure DP) per GPU by $\times 8$ but since we were already compute-bound previously, we will continue to be.
+    \end{enumerate}
+\end{enumerate}
+
+\subsection*{Q3}
+
+\begin{enumerate}[label=(\roman*)]
+    \item \[
+    16\text{B} \Rightarrow \frac{192 \cdot 4096}{192} = 4096 \;\text{tokens/GPU}
+    \]
+    \[
+    70\text{B} = \frac{384 \cdot 4096}{768} = 2048 \;\text{tokens/GPU}
+    \]
+    \[
+    314\text{B} = \frac{1536 \cdot 4096}{3072} = 2048 \;\text{tokens/GPU}
+    \]
+
+    \item All the models are compute bound under these pure-dp sharding schemes. Their tensor parallelism setting for each model is also around the compute-bound setting as well.
+\end{enumerate}
+
+\end{document}
