@@ -86,19 +86,21 @@ H100 details:
 \text{Intensity}_{\text{bf16}}(\text{matmul}) = \frac{2BDF}{2BD + 2DF + 2BF} \approx B
 \]
 
+
+
 \begin{enumerate}[label=(\roman*)]
     \item $\text{fp16}[64, 4096] \cdot \text{fp16}[4096, 8192]$
 
     $64 < 288 \Rightarrow$ bw bound
     \[
-    \Tmath = \frac{2BD + 2DF + 2BF}{\text{B200 mem bytes/s}} = 8.6 \;\mu s
+    T_{\text{matmul}} = \frac{2BD + 2DF + 2BF}{\text{B200 mem bytes/s}} = 8.6 \;\mu s
     \]
 
     \item $\text{fp16}[512, 4096] \cdot \text{fp16}[4096, 8192]$
 
     $512 > 288 \Rightarrow$ compute bound
     \[
-    \Tmath = \frac{2BDF}{\text{B200 fp16 FLOPs/s}} = 14.9 \;\mu s
+    T_{\text{matmul}} = \frac{2BDF}{\text{B200 fp16 FLOPs/s}} = 14.9 \;\mu s
     \]
 \end{enumerate}
 
@@ -295,6 +297,8 @@ Let $M = \#$ of nodes in SU $= 32$.
 &= \frac{2DF \cdot (M-1)}{M \cdot W_{\text{node egress}}} = \frac{2DF \cdot 31}{32 \cdot 400 \cdot 10^9}
 \end{align*}
 
+The time to do the reduction at the node level is less than that at the network level, so under our roofline model of perfect overlap, the total time will take $\Tcomm^{\text{network}}$.
+
 \textbf{Case 2} ($Y > 8$):
 
 $\Tcomm^{\text{node}} = 0$ (no intra-node AG needs to be done)
@@ -453,6 +457,7 @@ B200 DGX Superpod has:
 \begin{itemize}[leftmargin=1.5em]
     \item 900 GB/s egress within a node
     \item 400 GB/s in scale-out network
+    \item Assuming bf16 values
 \end{itemize}
 
 For DP:
@@ -465,6 +470,18 @@ At the node level:
 At the network level:
 \[
 \frac{B}{X} > \frac{2250 \cdot 10^{12}}{400 \cdot 10^9} = 5625
+\]
+
+For TP:
+
+Node level:
+\[
+Y < \frac{F \cdot W_{\text{gpu egress}}}{C} \Rightarrow Y < \frac{F}{2500}
+\]
+
+Network level:
+\[
+Y < \frac{F}{5625}
 \]
 
 \subsection*{Q2}
@@ -496,26 +513,21 @@ Llama-3 70B training in bf16 w/ fp32 Adam optimizer state.
         Y < \frac{F \cdot 400 \cdot 10^9}{990 \cdot 10^{12}} \approx 11
         \]
         Can't choose 2 nodes since $< 11$
-        $\Rightarrow$ we could do 8-way model parallelism
+        $\Rightarrow$ we could do 8-way model parallelism.
 
-        \item If we use all 4096 chips, this means $\frac{4096}{8} = 512$-way DP.
+        \item If we use pure-dp, our model weights + opt state are only sharded on the TP axis which means:
+        \[
+        \frac{700}{8} = 87.5 \;\text{GB/GPU}
+        \]
+        which is more than each H100 can handle, so pure-dp is not possible.
 
-        With a 4M BS, this means
+        With ZeRO-3 sharding, our weights + optimizer state are sharded along the DP axis as well which is only 0.17 GB/GPU, so we have plenty of space for our activations and gradient checkpoints. This parallelism scheme should now work. However, under this scheme, we have a per-GPU batch size of
         \[
-        \Tmath = \frac{2 \cdot 2 \cdot 2 \cdot B \cdot D \cdot \left(\frac{F}{8}\right)}{512 \cdot C}
+        \frac{4 \cdot 10^6}{4096} \approx 977, \qquad 977 < \frac{C}{W} = 2475
         \]
-        \[
-        \Tcomm = \frac{2 \cdot 2 \cdot 2 \cdot D \cdot \left(\frac{F}{8}\right)}{\Wcoll}
-        \]
-        \[
-        \Rightarrow \frac{B}{X} > \underbrace{\frac{C}{\Wcoll}}_{\substack{\text{network}\\ \text{level}}} = 2475
-        \]
-        \[
-        \frac{B}{X} = \frac{4 \cdot 10^6}{512} = 7812 > 2475
-        \]
-        We should still be compute-bound under this scheme.
+        so we will be comm-bounded.
 
-        \item W/ 8-way pipelining, we get an even bigger BS (smaller pure DP) per GPU by $\times 8$ but since we were already compute-bound previously, we will continue to be.
+        \item If we use 8-way PP, the network level comms for the DP comms go down by a factor of 8 so our critical GPU bs becomes 309. With this added to our scheme, we are now compute bounded!
     \end{enumerate}
 \end{enumerate}
 
@@ -532,7 +544,11 @@ Llama-3 70B training in bf16 w/ fp32 Adam optimizer state.
     314\text{B} = \frac{1536 \cdot 4096}{3072} = 2048 \;\text{tokens/GPU}
     \]
 
-    \item All the models are compute bound under these pure-dp sharding schemes. Their tensor parallelism setting for each model is also around the compute-bound setting as well.
+    \item For the 16B model, the per GPU bs $4096 > 2475$ and the TP $Y$ sharding is $< \frac{4 \cdot 6144}{2475}$ so this parallelism scheme is comp bounded.
+
+    For the 70B model, the per GPU bs $2048 > \frac{2475}{\underbrace{2}_{\text{2-way PP}}} = 1237.5$ and the TP $Y$ sharding is $< \frac{4 \cdot 8192}{2475}$ so this parallelism scheme is comp bounded.
+
+    For the 314B model, the per GPU bs is $2048 > \frac{2475}{\underbrace{8}_{\text{8-way PP}}} = 309$ and the TPU $Y$ sharding is $< \frac{4 \cdot 16384}{2475} = 26$ so this parallelism scheme is comp-bounded.
 \end{enumerate}
 
 \end{document}
